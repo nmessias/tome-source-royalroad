@@ -6,17 +6,14 @@
       "name": "tome-source-royalroad",
       "dependencies": {
         "linkedom": "^0.16.0",
+        "tome": "github:nmessias/tome",
       },
       "devDependencies": {
         "@types/bun": "latest",
-        "tome": "github:nmessias/tome",
         "typescript": "^5.0.0",
       },
       "optionalDependencies": {
         "playwright": "^1.40.0",
-      },
-      "peerDependencies": {
-        "tome": ">=1.5.0",
       },
     },
   },
@@ -247,7 +244,7 @@
 
     "tar-stream": ["tar-stream@2.2.0", "", { "dependencies": { "bl": "^4.0.3", "end-of-stream": "^1.4.1", "fs-constants": "^1.0.0", "inherits": "^2.0.3", "readable-stream": "^3.1.1" } }, "sha512-ujeqbceABgwMZxEJnk2HDY2DlnUZ+9oEcb1KzTVfYHio0UE6dG71n60d8D2I4qNvleWrrXpmjpt7vZeF1LnMZQ=="],
 
-    "tome": ["tome@github:nmessias/tome#a0bd456", { "dependencies": { "@kitajs/html": "^4.2.11", "@kitajs/ts-html-plugin": "^4.1.3", "better-auth": "^1.4.9", "better-sqlite3": "^12.5.0", "jszip": "^3.10.1", "qrcode": "^1.5.4" }, "optionalDependencies": { "playwright": "^1.40.0" } }, "nmessias-tome-a0bd456", "sha512-OfIsaRHoAaGxtJJHwx29FeeJiY2AYFhJDYcIcmhZsGr6OkpU1NKiapHov1dOSQzcRiDS8+v2Up4JuEZJtP9/5Q=="],
+    "tome": ["tome@github:nmessias/tome#4cfa905", { "dependencies": { "@kitajs/html": "^4.2.11", "@kitajs/ts-html-plugin": "^4.1.3", "better-auth": "^1.4.9", "better-sqlite3": "^12.5.0", "jszip": "^3.10.1", "qrcode": "^1.5.4" }, "optionalDependencies": { "playwright": "^1.40.0" } }, "nmessias-tome-4cfa905", "sha512-xH8tXiNosVNtcAp8iP8EzSa1F0zsMwTNGQWx57Zj8Ifb2W0waFqxzew3e3z3hCYAJUaLEPCIO7CzS5w3pFkfSQ=="],
 
     "tslib": ["tslib@2.8.1", "", {}, "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w=="],
 
