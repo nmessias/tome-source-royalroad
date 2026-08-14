@@ -8,7 +8,13 @@
     "type": "git",
     "url": "https://github.com/nmessias/tome-source-royalroad"
   },
-  "keywords": ["tome", "royal-road", "web-fiction", "e-ink", "source"],
+  "keywords": [
+    "tome",
+    "royal-road",
+    "web-fiction",
+    "e-ink",
+    "source"
+  ],
   "type": "module",
   "main": "src/index.ts",
   "exports": {
@@ -21,17 +27,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "linkedom": "^0.16.0"
-  },
-  "peerDependencies": {
-    "tome": ">=1.5.0"
+    "linkedom": "^0.16.0",
+    "tome": "github:nmessias/tome"
   },
   "optionalDependencies": {
     "playwright": "^1.40.0"
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "tome": "github:nmessias/tome",
     "typescript": "^5.0.0"
   }
 }
