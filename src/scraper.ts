@@ -1377,7 +1377,9 @@ export async function getChapter(chapterId: number, userId?: string, ttl?: numbe
       }
     });
     
-    // Keep only safe styles
+    // Keep only safe styles. width is allowed so tables keep their authored
+    // column layout — stripped, RR tables auto-size from content and overflow
+    // the reader column (bleeding into the next page on e-ink).
     cloned.querySelectorAll('[style]').forEach(el => {
       const style = el.getAttribute('style') || '';
       const safeStyles: string[] = [];
@@ -1385,16 +1387,43 @@ export async function getChapter(chapterId: number, userId?: string, ttl?: numbe
       const textAlign = style.match(/text-align:\s*([^;]+)/i);
       const fontWeight = style.match(/font-weight:\s*([^;]+)/i);
       const fontStyle = style.match(/font-style:\s*([^;]+)/i);
+      const width = style.match(/(?:^|;)\s*width:\s*(\d+(?:\.\d+)?%|[0-9]+px)/i);
       
       if (textAlign) safeStyles.push(`text-align: ${textAlign[1].trim()}`);
       if (fontWeight) safeStyles.push(`font-weight: ${fontWeight[1].trim()}`);
       if (fontStyle) safeStyles.push(`font-style: ${fontStyle[1].trim()}`);
+      if (width) safeStyles.push(`width: ${width[1]}`);
       
       if (safeStyles.length > 0) {
         el.setAttribute('style', safeStyles.join('; '));
       } else {
         el.removeAttribute('style');
       }
+    });
+    
+    // Emit a colgroup so the reader's table-layout: fixed keeps RR's authored
+    // column proportions. Fixed layout reads widths from the FIRST row only,
+    // but RR tables hide their widths behind a colspan header row — so take
+    // the first row whose cells all carry explicit (non-colspan) widths.
+    cloned.querySelectorAll('table').forEach((table) => {
+      const widthRow = [...table.querySelectorAll('tr')].find((row) => {
+        const cells = [...row.querySelectorAll(':scope > td, :scope > th')];
+        return cells.length > 0 && cells.every((c) =>
+          !c.getAttribute('colspan') && /width\s*:\s*\d/.test(c.getAttribute('style') || '')
+        );
+      });
+      if (!widthRow) return;
+      const colWidths = [...widthRow.querySelectorAll(':scope > td, :scope > th')]
+        .map((c) => (c.getAttribute('style') || '').match(/width:\s*([^;]+)/i)?.[1])
+        .filter((w): w is string => !!w);
+      if (colWidths.length === 0) return;
+      const colgroup = document.createElement('colgroup');
+      for (const w of colWidths) {
+        const col = document.createElement('col');
+        col.setAttribute('style', `width: ${w.trim()}`);
+        colgroup.appendChild(col);
+      }
+      table.insertBefore(colgroup, table.firstChild);
     });
     
     cleanContent = cloned.innerHTML;
