@@ -1401,30 +1401,34 @@ export async function getChapter(chapterId: number, userId?: string, ttl?: numbe
       }
     });
     
-    // Emit a colgroup so the reader's table-layout: fixed keeps RR's authored
-    // column proportions. Fixed layout reads widths from the FIRST row only,
-    // but RR tables hide their widths behind a colspan header row — so take
-    // the first row whose cells all carry explicit (non-colspan) widths.
+    // Mark multi-column tables as responsive. RR's cell widths target desktop
+    // layouts; keeping them with a large e-ink font makes useful columns too
+    // narrow. The reader's auto layout will size columns from their content.
     cloned.querySelectorAll('table').forEach((table) => {
       const widthRow = [...table.querySelectorAll('tr')].find((row) => {
         const cells = [...row.querySelectorAll(':scope > td, :scope > th')];
-        return cells.length > 0 && cells.every((c) =>
+        return cells.length > 1 && cells.every((c) =>
           !c.getAttribute('colspan') && /width\s*:\s*\d/.test(c.getAttribute('style') || '')
         );
       });
       if (!widthRow) return;
-      const colWidths = [...widthRow.querySelectorAll(':scope > td, :scope > th')]
-        .map((c) => (c.getAttribute('style') || '').match(/width:\s*([^;]+)/i)?.[1])
-        .filter((w): w is string => !!w);
-      if (colWidths.length < 2) return;
-      table.setAttribute('class', `${table.getAttribute('class') || ''} responsive-table`.trim());
-      const colgroup = document.createElement('colgroup');
-      for (const w of colWidths) {
-        const col = document.createElement('col');
-        col.setAttribute('style', `width: ${w.trim()}`);
-        colgroup.appendChild(col);
-      }
-      table.insertBefore(colgroup, table.firstChild);
+      const rows = [...table.querySelectorAll('tr')];
+      const columnCount = Math.max(0, ...rows.map((row) =>
+        [...row.querySelectorAll(':scope > td, :scope > th')]
+          .reduce((count, cell) => count + Number(cell.getAttribute('colspan') || 1), 0)
+      ));
+      const classes = ['responsive-table'];
+      if (columnCount >= 4 || rows.length >= 8) classes.push('large-table');
+      table.setAttribute('class', `${table.getAttribute('class') || ''} ${classes.join(' ')}`.trim());
+      table.querySelectorAll('td, th').forEach((cell) => {
+        const style = cell.getAttribute('style') || '';
+        const withoutWidth = style
+          .replace(/(?:^|;)\s*width\s*:\s*[^;]+;?/i, '')
+          .replace(/^\s*;|;\s*$/g, '')
+          .trim();
+        if (withoutWidth) cell.setAttribute('style', withoutWidth);
+        else cell.removeAttribute('style');
+      });
     });
     
     cleanContent = cloned.innerHTML;
