@@ -1416,7 +1416,8 @@ export async function getChapter(chapterId: number, userId?: string, ttl?: numbe
       const colWidths = [...widthRow.querySelectorAll(':scope > td, :scope > th')]
         .map((c) => (c.getAttribute('style') || '').match(/width:\s*([^;]+)/i)?.[1])
         .filter((w): w is string => !!w);
-      if (colWidths.length === 0) return;
+      if (colWidths.length < 2) return;
+      table.setAttribute('class', `${table.getAttribute('class') || ''} responsive-table`.trim());
       const colgroup = document.createElement('colgroup');
       for (const w of colWidths) {
         const col = document.createElement('col');
