@@ -1231,11 +1231,21 @@ export async function getFiction(id: number, userId?: string, ttl: number = CACH
   return fiction;
 }
 
-export async function getChapter(chapterId: number, userId?: string, ttl?: number): Promise<ChapterContent | null> {
+export async function getChapter(
+  chapterId: number,
+  userId?: string,
+  ttl?: number,
+  opts?: { forceLive?: boolean }
+): Promise<ChapterContent | null> {
   const cacheKey = `chapter:${chapterId}`;
   const isPreCaching = ttl !== undefined;
-  
-  if (isPreCaching) {
+
+  // Cache-first on every path. The reader's live GETs used to skip the cache
+  // entirely (only pre-caching consulted it), so every chapter read re-scraped
+  // Royal Road from scratch and never reused the 30-day row. Only the
+  // mark-as-read path (forceLive) must hit upstream — that's how RR records
+  // read state.
+  if (!opts?.forceLive) {
     const cached = getCache(cacheKey);
     if (cached) {
       console.log(`Returning cached chapter: ${chapterId}`);

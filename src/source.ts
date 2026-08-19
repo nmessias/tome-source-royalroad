@@ -117,7 +117,9 @@ export const royalroadSource: Source = {
   async updateProgress(userId, _fictionRef, chapterRef) {
     const id = parseId(chapterRef);
     if (id === null) return;
-    await getChapter(id, userId);
+    // Mark-as-read requires a real authenticated upstream fetch (that's how RR
+    // records read state); forceLive bypasses the cache-first fast path.
+    await getChapter(id, userId, undefined, { forceLive: true });
   },
 
   // ---- credentials ----
