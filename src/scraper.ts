@@ -89,97 +89,47 @@ function extractCoreTitle(title: string): string {
 /**
  * Extract text content from first N block elements or first N characters of HTML
  */
-function extractFirstLines(html: string, maxChars: number = 500): string {
+/**
+ * Extract text from the FIRST block-level element of the content.
+ * A title duplicate, when it exists, is always the opening element — not a
+ * word buried a few sentences in (which is just the story beginning).
+ */
+function extractFirstBlock(html: string): string {
   const { document } = parseHTML(`<div>${html}</div>`);
   const root = document.querySelector('div');
   if (!root) return '';
-  
-  // Get text from first 3 block-level elements
-  const blockElements = root.querySelectorAll('p, div, h1, h2, h3, h4, h5, h6');
-  let text = '';
-  let count = 0;
-  
-  for (const el of blockElements) {
-    if (count >= 3) break;
-    const elText = el.textContent?.trim();
-    if (elText) {
-      text += elText + '\n';
-      count++;
-    }
-  }
-  
-  // Fallback: if no block elements found, get raw text content
-  if (!text.trim()) {
-    text = root.textContent || '';
-  }
-  
-  // Limit to maxChars
-  return text.slice(0, maxChars);
+  const first = root.querySelector('p, div, h1, h2, h3, h4, h5, h6');
+  return first?.textContent?.trim() ?? '';
 }
 
 /**
- * Calculate word overlap percentage between two strings
+ * True when `text` opens with `title` — identical, or the title followed by a
+ * word boundary. A leading, near-exact match: the only case where the content
+ * genuinely restates the title as its opening.
  */
-function wordOverlap(str1: string, str2: string): number {
-  const words1 = str1.split(/\s+/).filter(w => w.length > 2); // Ignore very short words
-  const words2 = str2.split(/\s+/).filter(w => w.length > 2);
-  
-  if (words1.length === 0) return 0;
-  
-  let matches = 0;
-  for (const word of words1) {
-    if (words2.some(w => w.includes(word) || word.includes(w))) {
-      matches++;
-    }
-  }
-  
-  return matches / words1.length;
+function startsWithTitle(text: string, title: string): boolean {
+  if (!title) return false;
+  return text === title || text.startsWith(title + ' ');
 }
 
 /**
- * Check if the chapter title (or a significant part of it) already appears
- * in the first few lines of the content
+ * Decide whether to prepend a title heading into the chapter body.
+ * Suppress ONLY when the content already opens with a literal restatement of
+ * the title (its full form, or its "core" title after stripping "Chapter N"
+ * prefixes). A title word showing up later in the body is just the story
+ * beginning, so the title is still prepended — the reader header is hidden
+ * while reading, so the in-content heading is what the user actually sees.
  */
-function shouldPrependTitle(title: string, htmlContent: string): boolean {
+export function shouldPrependTitle(title: string, htmlContent: string): boolean {
   if (!title || !htmlContent) return true;
-  
   const normalizedTitle = normalizeText(title);
   const coreTitle = extractCoreTitle(title);
-  const firstLines = extractFirstLines(htmlContent);
-  const normalizedContent = normalizeText(firstLines);
-  
-  // Check 1: Full title appears as substring
-  if (normalizedContent.includes(normalizedTitle)) {
-    return false;
-  }
-  
-  // Check 2: Core title appears as substring (if different from full title)
-  if (coreTitle && coreTitle !== normalizedTitle && normalizedContent.includes(coreTitle)) {
-    return false;
-  }
-  
-  // Check 3: High word overlap (60%+) between core title and content
-  if (coreTitle && coreTitle.length > 3) {
-    const overlap = wordOverlap(coreTitle, normalizedContent);
-    if (overlap >= 0.6) {
-      return false;
-    }
-  }
-  
-  // Check 4: Chapter number appears at the start of content
-  // e.g., title is "Chapter 47" and content starts with "47" or "Chapter 47"
-  const chapterNumMatch = normalizedTitle.match(/(?:chapter|ch\.?)\s*(\d+)/i) || normalizedTitle.match(/^(\d+)/);
-  if (chapterNumMatch) {
-    const chapterNum = chapterNumMatch[1];
-    // Check if content starts with this number (with some flexibility)
-    const contentStart = normalizedContent.slice(0, 50);
-    if (contentStart.match(new RegExp(`^\\s*(?:chapter|ch\\.?)?\\s*${chapterNum}\\b`, 'i'))) {
-      return false;
-    }
-  }
-  
-  // No match found - should prepend the title
-  return true;
+  const firstBlock = normalizeText(extractFirstBlock(htmlContent));
+
+  return !(
+    startsWithTitle(firstBlock, normalizedTitle) ||
+    (coreTitle && coreTitle !== normalizedTitle && startsWithTitle(firstBlock, coreTitle))
+  );
 }
 
 /**
