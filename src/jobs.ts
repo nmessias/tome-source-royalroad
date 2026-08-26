@@ -49,8 +49,9 @@ async function warmFollowsCache(): Promise<void> {
   try {
     const { getFollows, getChapter, getFiction } = await getScraperFunctions();
     
-    if (isCached("follows")) {
+    if (isCached(`follows:${adminUserId}`)) {
       console.log("[Job] Follows list already cached, skipping fetch");
+      return;
     }
     
     const follows = await getFollows(adminUserId);

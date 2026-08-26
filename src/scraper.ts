@@ -1467,7 +1467,7 @@ export async function getChapter(
     fictionUrl: `/fiction/${fictionInfo.fictionId}`,
   };
 
-  setCache(cacheKey, JSON.stringify(result), CACHE_TTL.CHAPTER);
+  setCache(cacheKey, JSON.stringify(result), ttl ?? CACHE_TTL.CHAPTER);
 
   if (!isPreCaching && userId) {
     if (fictionInfo.fictionId) {
