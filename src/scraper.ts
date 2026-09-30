@@ -616,6 +616,33 @@ function parseFictionList(html: string): Fiction[] {
 
 // ============ Scraper Functions ============
 
+/**
+ * The label text of a follows row, i.e. everything in the <li> that is not the
+ * chapter link: "Last Update:", "Last read:", "Last Update & Last Read:".
+ * Dropping the link keeps a chapter title that happens to contain the label
+ * words from being read as the label itself.
+ */
+function readRowLabel(li: Element): string {
+  const clone = li.cloneNode(true) as Element;
+  for (const link of Array.from(clone.querySelectorAll("a"))) {
+    link.remove();
+  }
+  return clone.textContent || "";
+}
+
+/**
+ * How long ago a row's chapter was touched, as Royal Road words it
+ * ("32 minutes ago"). It renders this as a <time> element followed by a plain
+ * " ago" text node, so read the whole wrapper rather than the <time> alone —
+ * that way the trailing unit survives even if the split moves.
+ */
+function readRowAgo(li: Element): string | undefined {
+  const holder = li.querySelector("time")?.parentElement;
+  if (!holder) return undefined;
+  const text = (holder.textContent || "").replace(/\s+/g, " ").trim();
+  return text || undefined;
+}
+
 export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS): Promise<FollowedFiction[]> {
   const cacheKey = `follows:${userId}`;
   const cached = getCache(cacheKey);
@@ -675,22 +702,38 @@ export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS
       let lastReadChapterId: number | undefined;
       let nextChapterId: number | undefined;
       let nextChapterTitle: string | undefined;
+      let lastUpdateAgo: string | undefined;
+      let lastReadAgo: string | undefined;
       
       for (const li of listItems) {
-        const text = li.textContent || "";
         const chapterLink = li.querySelector("a[href*='/chapter/']");
         const chapterNameEl = li.querySelector("a span.col-xs-8");
         const chapterName = chapterNameEl?.textContent?.trim() || "";
         const chapterHref = chapterLink?.getAttribute("href") || "";
         const chapterIdMatch = chapterHref.match(/\/chapter\/(\d+)/);
         const chapterId = chapterIdMatch ? parseInt(chapterIdMatch[1], 10) : undefined;
-        
-        if (text.includes("Last Update:")) {
+
+        // Match on the label alone, never on the whole row: the chapter title
+        // is part of the row text, so a chapter called "Last Read It All"
+        // would otherwise be mistaken for the label. Royal Road has shipped
+        // these as "Last Update:", "Last Read Chapter:" and now "Last read:",
+        // and folds both into a single "Last Update & Last Read:" row when a
+        // fiction has one chapter — so match the words, unanchored, on the
+        // label only, and let one row fill in both.
+        const label = readRowLabel(li);
+        // Royal Road writes the recency as "32 minutes " + "ago" split across
+        // the <time> and a trailing text node, so take the <time> text and add
+        // the unit back rather than scraping the rendered string.
+        const ago = readRowAgo(li);
+        if (/last\s+update/i.test(label)) {
           latestChapter = chapterName;
           latestChapterId = chapterId;
-        } else if (text.includes("Last Read Chapter:")) {
+          lastUpdateAgo = ago;
+        }
+        if (/last\s+read/i.test(label)) {
           lastReadChapter = chapterName;
           lastReadChapterId = chapterId;
+          lastReadAgo = ago;
         }
       }
       
@@ -725,6 +768,8 @@ export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS
         lastReadChapterId,
         nextChapterId,
         nextChapterTitle,
+        lastUpdateAgo,
+        lastReadAgo,
         _nextChapterUrl: nextChapterUrl, // Temporary field for redirect resolution
       } as FollowedFiction & { _nextChapterUrl?: string });
     } catch (e) {
