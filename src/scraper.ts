@@ -372,14 +372,20 @@ async function createAnonContext(): Promise<void> {
   console.log("Anonymous context created (for caching without auth)");
 }
 
+let lastBrowserLoginAttempt = 0;
+// Cloudflare challenges the login POST and, when it does not clear, the whole
+// browser session stays challenged afterwards (even /home times out). Retrying
+// on every login redirect therefore makes things worse, so back off hard.
+const BROWSER_LOGIN_COOLDOWN = 30 * 60 * 1000; // 30m
+
 /**
  * Log in to Royal Road with ROYAL_ROAD_USERNAME/PASSWORD inside Firefox and
  * store the resulting session cookie.
  *
  * The HTTP implementation in royalroad-auth.ts cannot do this any more:
  * Cloudflare answers plain fetches from datacenter IPs with a challenge page,
- * so that path never finds the CSRF token and reports "already logged in"
- * without logging in at all. Driving the real browser gets us a page that
+ * so that path never finds the CSRF token and used to report "already logged
+ * in" without logging in at all. Driving the real browser gets us a page that
  * actually contains the login form.
  */
 export async function performBrowserLogin(userId: string): Promise<boolean> {
@@ -391,6 +397,14 @@ export async function performBrowserLogin(userId: string): Promise<boolean> {
     console.error("[AutoLogin] ROYAL_ROAD_USERNAME / ROYAL_ROAD_PASSWORD are not configured");
     return false;
   }
+  if (Date.now() - lastBrowserLoginAttempt < BROWSER_LOGIN_COOLDOWN) {
+    console.warn(
+      "[AutoLogin] Skipping browser login (attempted recently). " +
+      "A fresh session cookie in Settings is the reliable path."
+    );
+    return false;
+  }
+  lastBrowserLoginAttempt = Date.now();
 
   await ensureBrowser();
   if (!browser) {
