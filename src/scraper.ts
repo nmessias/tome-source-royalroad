@@ -7,7 +7,7 @@ import { parseHTML } from "linkedom";
 import { getCache, setCache, deleteCache } from "tome";
 import { getRoyalRoadCookiesForPlaywright, hasRoyalRoadSession, setRoyalRoadCookie } from "./royalroad-credentials";
 import { CACHE_TTL } from "tome";
-import { ROYAL_ROAD_BASE_URL, ROYAL_ROAD_USERNAME, ROYAL_ROAD_PASSWORD, SCRAPER_TIMEOUT, SCRAPER_SELECTOR_TIMEOUT, ENABLE_BROWSER } from "./config";
+import { ROYAL_ROAD_BASE_URL, ROYAL_ROAD_USERNAME, ROYAL_ROAD_PASSWORD, BROWSER_ENGINE, BROWSER_HEADLESS, SCRAPER_TIMEOUT, SCRAPER_SELECTOR_TIMEOUT, ENABLE_BROWSER } from "./config";
 import { performAutoLogin, ROYAL_ROAD_AUTO_LOGIN_ENABLED } from "./royalroad-auth";
 
 // Playwright types (imported dynamically when ENABLE_BROWSER=true)
@@ -289,25 +289,42 @@ export async function initBrowser(): Promise<void> {
   
   if (browser) return;
 
-  console.log("Initializing Firefox browser...");
+  console.log(`Initializing ${BROWSER_ENGINE} browser (headless=${BROWSER_HEADLESS})...`);
   const startTime = Date.now();
-  
-  const { firefox } = await import("playwright");
-  browser = await firefox.launch({
-    headless: true,
-    firefoxUserPrefs: {
-      "browser.cache.disk.enable": false,
-      "browser.cache.memory.enable": true,
-      "browser.cache.memory.capacity": 32768,
-      "browser.sessionhistory.max_entries": 2,
-      "browser.sessionstore.max_tabs_undo": 0,
-      "media.autoplay.enabled": false,
-      "media.peerconnection.enabled": false,
-      "dom.webnotifications.enabled": false,
-      "geo.enabled": false,
-    },
-  });
-  console.log(`Firefox launched in ${Date.now() - startTime}ms`);
+
+  if (BROWSER_ENGINE === "chromium") {
+    // channel "chromium" selects the full browser build; Playwright's default
+    // is chromium-headless-shell, which Cloudflare fingerprints easily.
+    const { chromium } = await import("playwright");
+    browser = await chromium.launch({
+      channel: "chromium",
+      headless: BROWSER_HEADLESS,
+      args: [
+        // Makes navigator.webdriver false, so the stealth init script is only
+        // belt-and-braces.
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+      ],
+    });
+    console.log(`Chromium launched in ${Date.now() - startTime}ms`);
+  } else {
+    const { firefox } = await import("playwright");
+    browser = await firefox.launch({
+      headless: true,
+      firefoxUserPrefs: {
+        "browser.cache.disk.enable": false,
+        "browser.cache.memory.enable": true,
+        "browser.cache.memory.capacity": 32768,
+        "browser.sessionhistory.max_entries": 2,
+        "browser.sessionstore.max_tabs_undo": 0,
+        "media.autoplay.enabled": false,
+        "media.peerconnection.enabled": false,
+        "dom.webnotifications.enabled": false,
+        "geo.enabled": false,
+      },
+    });
+    console.log(`Firefox launched in ${Date.now() - startTime}ms`);
+  }
 
   await createAnonContext();
   console.log("Browser initialized");
@@ -325,8 +342,10 @@ export async function createContext(userId: string): Promise<void> {
   const cookies = getRoyalRoadCookiesForPlaywright(userId);
   console.log(`Creating context with ${cookies.length} cookies: ${cookies.map((c: { name: string }) => c.name).join(", ")}`);
   
+  // No userAgent override: claiming a Chrome UA from a Firefox build (or from a
+  // Chromium whose real version differs) is a fingerprint mismatch that makes
+  // Cloudflare reject requests. Let the browser report itself.
   context = await browser.newContext({
-    userAgent: USER_AGENT,
     viewport: { width: 1280, height: 720 },
     locale: "en-US",
     timezoneId: "America/New_York",
@@ -357,7 +376,6 @@ async function createAnonContext(): Promise<void> {
   }
 
   anonContext = await browser.newContext({
-    userAgent: USER_AGENT,
     viewport: { width: 1280, height: 720 },
     locale: "en-US",
     timezoneId: "America/New_York",
@@ -413,10 +431,9 @@ export async function performBrowserLogin(userId: string): Promise<boolean> {
   }
 
   const startTime = Date.now();
-  console.log("[AutoLogin] Logging in to Royal Road via Firefox...");
+  console.log(`[AutoLogin] Logging in to Royal Road via ${BROWSER_ENGINE}...`);
 
   const ctx = await browser.newContext({
-    userAgent: USER_AGENT,
     viewport: { width: 1280, height: 720 },
     locale: "en-US",
     timezoneId: "America/New_York",
@@ -445,27 +462,26 @@ export async function performBrowserLogin(userId: string): Promise<boolean> {
       page.click('form:has(input[name="Password"]) button[type="submit"]:not([name="provider"])'),
     ]);
 
-    // Cloudflare often challenges the login POST itself and then sits on the
-    // interstitial instead of solving it. Poll briefly for the cookie, then
-    // give up with an actionable message rather than hanging.
+    // The submit triggers a navigation (and sometimes a brief Cloudflare
+    // interstitial), so poll for the cookie rather than sampling once: right
+    // after the click the page is still the login form.
     let identity = null;
     const deadline = Date.now() + SCRAPER_SELECTOR_TIMEOUT;
     while (Date.now() < deadline) {
-      const cookies = await ctx.cookies();
-      identity = cookies.find((c) => c.name === ".AspNetCore.Identity.Application");
+      identity = (await ctx.cookies()).find((c) => c.name === ".AspNetCore.Identity.Application");
       if (identity) break;
-      const title = await page.title().catch(() => "");
-      if (title && !/just a moment/i.test(title)) break;
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1500);
     }
 
     if (!identity) {
-      const stuck = /just a moment/i.test(await page.title().catch(() => ""));
+      const title = await page.title().catch(() => "");
+      const stuck = /just a moment/i.test(title);
       console.error(
         stuck
           ? "[AutoLogin] Cloudflare is challenging the login submission and is not clearing it. " +
             "Paste a fresh session cookie in Settings > Royal Road instead."
-          : "[AutoLogin] Login did not produce a session cookie - check ROYAL_ROAD_USERNAME/PASSWORD"
+          : `[AutoLogin] Login did not produce a session cookie (landed on "${title || page.url()}") - ` +
+            "check ROYAL_ROAD_USERNAME/PASSWORD"
       );
       return false;
     }
@@ -485,7 +501,7 @@ export async function performBrowserLogin(userId: string): Promise<boolean> {
       return false;
     }
 
-    console.log(`[AutoLogin] Logged in via Firefox in ${Date.now() - startTime}ms`);
+    console.log(`[AutoLogin] Logged in via ${BROWSER_ENGINE} in ${Date.now() - startTime}ms`);
     return true;
   } catch (e) {
     console.error(`[AutoLogin] Browser login failed after ${Date.now() - startTime}ms:`, e);

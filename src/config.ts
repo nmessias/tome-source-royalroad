@@ -6,6 +6,17 @@ import type { ToplistType } from "tome";
 // Browser/Playwright (disabled by default for smaller image, set ENABLE_BROWSER=true to enable)
 export const ENABLE_BROWSER = process.env.ENABLE_BROWSER === "true";
 
+// Which Playwright engine to drive. Chromium is the default because Cloudflare
+// treats it far more leniently: it rejects the Royal Road login POST outright
+// when the browser is Firefox (or when Chromium runs headless), which breaks
+// auto-login.
+export const BROWSER_ENGINE = (process.env.ROYAL_ROAD_BROWSER || "chromium") as "chromium" | "firefox";
+
+// Headless is detected by Cloudflare (the login page never renders), so the
+// default is a real browser window. In a container that means running Xvfb and
+// pointing DISPLAY at it - see scripts/start.sh in the Tome repo.
+export const BROWSER_HEADLESS = process.env.ROYAL_ROAD_HEADLESS === "true";
+
 // Royal Road
 export const ROYAL_ROAD_BASE_URL = "https://www.royalroad.com";
 export const ROYAL_ROAD_USERNAME = process.env.ROYAL_ROAD_USERNAME || "";
