@@ -5,7 +5,7 @@
  */
 import { parseHTML } from "linkedom";
 import { getCache, setCache, deleteCache } from "tome";
-import { getRoyalRoadCookiesForPlaywright, hasRoyalRoadSession } from "./royalroad-credentials";
+import { getRoyalRoadCookiesForPlaywright, hasRoyalRoadSession, setRoyalRoadCookie } from "./royalroad-credentials";
 import { CACHE_TTL } from "tome";
 import { ROYAL_ROAD_BASE_URL, SCRAPER_TIMEOUT, SCRAPER_SELECTOR_TIMEOUT, ENABLE_BROWSER } from "./config";
 import { performAutoLogin, ROYAL_ROAD_AUTO_LOGIN_ENABLED } from "./royalroad-auth";
@@ -17,7 +17,11 @@ type Page = import("playwright").Page;
 import type { Fiction, FollowedFiction, Chapter, ChapterContent, ToplistType, HistoryEntry } from "tome";
 
 // Resource types to block for faster page loads (keep images for covers)
-const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other'] as const;
+// Everything the parser does not need. Images are the big one: a follows page
+// references a couple of cover thumbnails per entry and we only ever read the
+// src out of the markup, so downloading them just burns the machine's CPU and
+// bandwidth (and it makes Cloudflare challenges slower to settle).
+const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image'] as const;
 
 // Number words for normalization (chapter titles like "Chapter Forty-Seven")
 const NUMBER_WORDS: Record<string, string> = {
@@ -178,6 +182,24 @@ async function parallelLimit<T>(
 function getCookiesForFetch(userId: string): string {
   const cookies = getRoyalRoadCookiesForPlaywright(userId);
   return cookies.map((c: { name: string; value: string }) => `${c.name}=${c.value}`).join("; ");
+}
+
+/**
+ * Persist cookies learned from a browser visit. Royal Road rotates the
+ * session cookie on use, so keeping the freshest copy stops the fast HTTP
+ * path from drifting into "logged out" on a long-lived deployment.
+ */
+async function rememberCookiesFromBrowser(ctx: BrowserContext, userId?: string): Promise<void> {
+  if (!userId) return;
+  try {
+    const cookies = await ctx.cookies();
+    const identity = cookies.find((c) => c.name === ".AspNetCore.Identity.Application");
+    if (identity) setRoyalRoadCookie(userId, identity.name, identity.value);
+    const clearance = cookies.find((c) => c.name === "cf_clearance");
+    if (clearance) setRoyalRoadCookie(userId, "cf_clearance", clearance.value);
+  } catch (e) {
+    console.error("Failed to persist cookies from browser context:", e);
+  }
 }
 
 /**
@@ -470,6 +492,7 @@ async function getPage(
 
       const content = await page.content();
       console.log(`[Scraper] Firefox page fetched in ${Date.now() - startTime}ms total`);
+      await rememberCookiesFromBrowser(ctx, userId);
       const release = async () => {
         try { await page.close(); } catch {}
         for (const c of requestContexts) {
