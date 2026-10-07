@@ -615,13 +615,21 @@ async function getPage(
           const loggedIn = ENABLE_BROWSER
             ? await performBrowserLogin(userId)
             : await performAutoLogin(userId);
-          if (loggedIn) {
-            await createContext(userId);
-            ctx = context!;
-            requestContexts.push(ctx);
-            page = await ctx.newPage();
-            await blockResources(page);
+          // Always rebuild the page: it was just closed above, so retrying on
+          // it fails with "Target page, context or browser has been closed".
+          // When the login failed there is nothing new to try, so give up
+          // rather than burn the remaining attempts on a dead session.
+          if (!loggedIn) {
+            throw new Error(
+              "Royal Road rejected the stored session and auto-login could not restore it. " +
+              "Paste a fresh .AspNetCore.Identity.Application cookie in Settings > Royal Road."
+            );
           }
+          await createContext(userId);
+          ctx = context!;
+          requestContexts.push(ctx);
+          page = await ctx.newPage();
+          await blockResources(page);
           continue;
         }
       }
