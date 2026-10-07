@@ -7,7 +7,7 @@ import { parseHTML } from "linkedom";
 import { getCache, setCache, deleteCache } from "tome";
 import { getRoyalRoadCookiesForPlaywright, hasRoyalRoadSession, setRoyalRoadCookie } from "./royalroad-credentials";
 import { CACHE_TTL } from "tome";
-import { ROYAL_ROAD_BASE_URL, SCRAPER_TIMEOUT, SCRAPER_SELECTOR_TIMEOUT, ENABLE_BROWSER } from "./config";
+import { ROYAL_ROAD_BASE_URL, ROYAL_ROAD_USERNAME, ROYAL_ROAD_PASSWORD, SCRAPER_TIMEOUT, SCRAPER_SELECTOR_TIMEOUT, ENABLE_BROWSER } from "./config";
 import { performAutoLogin, ROYAL_ROAD_AUTO_LOGIN_ENABLED } from "./royalroad-auth";
 
 // Playwright types (imported dynamically when ENABLE_BROWSER=true)
@@ -372,6 +372,115 @@ async function createAnonContext(): Promise<void> {
   console.log("Anonymous context created (for caching without auth)");
 }
 
+/**
+ * Log in to Royal Road with ROYAL_ROAD_USERNAME/PASSWORD inside Firefox and
+ * store the resulting session cookie.
+ *
+ * The HTTP implementation in royalroad-auth.ts cannot do this any more:
+ * Cloudflare answers plain fetches from datacenter IPs with a challenge page,
+ * so that path never finds the CSRF token and reports "already logged in"
+ * without logging in at all. Driving the real browser gets us a page that
+ * actually contains the login form.
+ */
+export async function performBrowserLogin(userId: string): Promise<boolean> {
+  if (!ENABLE_BROWSER) {
+    console.warn("[AutoLogin] Browser login needs ENABLE_BROWSER=true");
+    return false;
+  }
+  if (!ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
+    console.error("[AutoLogin] ROYAL_ROAD_USERNAME / ROYAL_ROAD_PASSWORD are not configured");
+    return false;
+  }
+
+  await ensureBrowser();
+  if (!browser) {
+    console.error("[AutoLogin] No browser available");
+    return false;
+  }
+
+  const startTime = Date.now();
+  console.log("[AutoLogin] Logging in to Royal Road via Firefox...");
+
+  const ctx = await browser.newContext({
+    userAgent: USER_AGENT,
+    viewport: { width: 1280, height: 720 },
+    locale: "en-US",
+    timezoneId: "America/New_York",
+  });
+  await ctx.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+  });
+
+  const page = await ctx.newPage();
+  try {
+    await page.goto(`${ROYAL_ROAD_BASE_URL}/account/login?returnurl=%2Fhome`, {
+      waitUntil: "domcontentloaded",
+      timeout: SCRAPER_TIMEOUT,
+    });
+    await page.waitForSelector('input[name="Email"]', { timeout: SCRAPER_SELECTOR_TIMEOUT });
+
+    await page.fill('input[name="Email"]', ROYAL_ROAD_USERNAME);
+    await page.fill('input[name="Password"]', ROYAL_ROAD_PASSWORD);
+    // Scope to the credentials form: the social sign-in buttons are also
+    // <button type="submit"> and come first in the DOM, so an unscoped click
+    // signs in with Google (or bounces to /account/externallogin).
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: SCRAPER_TIMEOUT }).catch(() => {}),
+      page.click('form:has(input[name="Password"]) button[type="submit"]:not([name="provider"])'),
+    ]);
+
+    // Cloudflare often challenges the login POST itself and then sits on the
+    // interstitial instead of solving it. Poll briefly for the cookie, then
+    // give up with an actionable message rather than hanging.
+    let identity = null;
+    const deadline = Date.now() + SCRAPER_SELECTOR_TIMEOUT;
+    while (Date.now() < deadline) {
+      const cookies = await ctx.cookies();
+      identity = cookies.find((c) => c.name === ".AspNetCore.Identity.Application");
+      if (identity) break;
+      const title = await page.title().catch(() => "");
+      if (title && !/just a moment/i.test(title)) break;
+      await page.waitForTimeout(2000);
+    }
+
+    if (!identity) {
+      const stuck = /just a moment/i.test(await page.title().catch(() => ""));
+      console.error(
+        stuck
+          ? "[AutoLogin] Cloudflare is challenging the login submission and is not clearing it. " +
+            "Paste a fresh session cookie in Settings > Royal Road instead."
+          : "[AutoLogin] Login did not produce a session cookie - check ROYAL_ROAD_USERNAME/PASSWORD"
+      );
+      return false;
+    }
+
+    setRoyalRoadCookie(userId, identity.name, identity.value);
+    const clearance = (await ctx.cookies()).find((c) => c.name === "cf_clearance");
+    if (clearance) setRoyalRoadCookie(userId, "cf_clearance", clearance.value);
+
+    // Confirm the session actually works: a valid cookie still gets redirected
+    // to the login page when the account was logged out or the cookie rejected.
+    await page.goto(`${ROYAL_ROAD_BASE_URL}/my/follows`, {
+      waitUntil: "domcontentloaded",
+      timeout: SCRAPER_TIMEOUT,
+    });
+    if (page.url().includes("/account/login")) {
+      console.error("[AutoLogin] Still redirected to login after signing in - session was not accepted");
+      return false;
+    }
+
+    console.log(`[AutoLogin] Logged in via Firefox in ${Date.now() - startTime}ms`);
+    return true;
+  } catch (e) {
+    console.error(`[AutoLogin] Browser login failed after ${Date.now() - startTime}ms:`, e);
+    return false;
+  } finally {
+    try { await ctx.close(); } catch {}
+  }
+}
+
 async function getPage(
   url: string,
   waitForSelector?: string,
@@ -382,8 +491,13 @@ async function getPage(
   const useAnon = !userId;
   
   if (!useAnon && !hasRoyalRoadSession(userId)) {
-    if (ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
+    // Prefer the browser login: the HTTP login cannot get past Cloudflare.
+    if (ENABLE_BROWSER && ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
       console.log("[Scraper] No session found, attempting auto-login...");
+      if (!(await performBrowserLogin(userId))) {
+        throw new Error("Auto-login failed. Please configure your Royal Road session manually.");
+      }
+    } else if (ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
       const loggedIn = await performAutoLogin(userId);
       if (!loggedIn) {
         throw new Error("Auto-login failed. Please configure your Royal Road session manually.");
@@ -468,7 +582,9 @@ async function getPage(
         if (userId && !alreadyRetriedWithLogin && ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
           await page.close();
           console.log("[Scraper] Attempting auto-login before retry...");
-          const loggedIn = await performAutoLogin(userId);
+          const loggedIn = ENABLE_BROWSER
+            ? await performBrowserLogin(userId)
+            : await performAutoLogin(userId);
           if (loggedIn) {
             await createContext(userId);
             ctx = context!;

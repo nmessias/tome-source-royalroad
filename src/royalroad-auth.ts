@@ -34,6 +34,18 @@ export async function performAutoLogin(userId: string): Promise<boolean> {
     // Check for login page / CSRF token (also serves as "already logged in" check)
     const tokenMatch = loginHtml.match(/name="__RequestVerificationToken"[^>]*value="([^"]*)"/);
     if (!tokenMatch) {
+      // A Cloudflare challenge also lacks the CSRF token. Treating it as
+      // "already logged in" reports success while doing nothing, which used to
+      // leave the scraper with a dead session cookie and no explanation.
+      if (
+        loginHtml.includes("Just a moment") ||
+        loginHtml.includes("cf-browser-verification") ||
+        loginHtml.includes("challenge-platform") ||
+        loginHtml.includes("challenge-running")
+      ) {
+        console.error("[AutoLogin] Login page is behind a Cloudflare challenge - plain HTTP cannot get past it");
+        return false;
+      }
       if (loginPageRes.status === 302 || loginHtml.includes("window.location") || !loginHtml.includes("Sign In")) {
         console.log("[AutoLogin] Already logged in or login page not accessible, refreshing cookies");
         const cookieMatch = initialCookies.find(c => c.includes(".AspNetCore.Identity.Application"));

@@ -26,6 +26,8 @@ import {
   clearRoyalRoadCookies,
 } from "./royalroad-credentials";
 import { performAutoLogin, ROYAL_ROAD_AUTO_LOGIN_ENABLED } from "./royalroad-auth";
+import { performBrowserLogin } from "./scraper";
+import { ENABLE_BROWSER } from "./config";
 import { triggerCacheWarm } from "./jobs";
 import { clearCache } from "tome";
 
@@ -168,7 +170,11 @@ export const royalroadSource: Source = {
   autoLogin: {
     enabled: ROYAL_ROAD_AUTO_LOGIN_ENABLED,
     async refresh(userId) {
-      const ok = await performAutoLogin(userId);
+      // Cloudflare blocks the HTTP login from datacenter IPs, so prefer the
+      // browser login whenever the browser fallback is available.
+      const ok = ENABLE_BROWSER
+        ? await performBrowserLogin(userId)
+        : await performAutoLogin(userId);
       if (!ok) return false;
       await createContext(userId);
       await validateCookies(userId);
