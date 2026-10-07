@@ -297,10 +297,9 @@ export async function createContext(userId: string): Promise<void> {
     return;
   }
 
-  if (context) {
-    await context.close();
-  }
-
+  // Do NOT close the previous shared context here: a concurrent in-flight
+  // request may still hold open pages on it. Each getPage() call owns and
+  // closes the context(s) it creates instead.
   const cookies = getRoyalRoadCookiesForPlaywright(userId);
   console.log(`Creating context with ${cookies.length} cookies: ${cookies.map((c: { name: string }) => c.name).join(", ")}`);
   
@@ -356,7 +355,7 @@ async function getPage(
   waitForSelector?: string,
   userId?: string,
   alreadyRetriedWithLogin?: boolean
-): Promise<{ page: Page | null; content: string }> {
+): Promise<{ page: Page | null; content: string; release: () => Promise<void> }> {
   const startTime = Date.now();
   const useAnon = !userId;
   
@@ -376,7 +375,7 @@ async function getPage(
   const httpResult = await tryHttpFetch(url, userId);
   if (httpResult) {
     console.log(`[Scraper] HTTP fetch succeeded in ${Date.now() - startTime}ms total`);
-    return { page: null, content: httpResult.content };
+    return { page: null, content: httpResult.content, release: async () => {} };
   }
 
   if (!ENABLE_BROWSER) {
@@ -398,14 +397,17 @@ async function getPage(
     }
   }
 
-  const ctx = useAnon ? anonContext : context;
+  let ctx = useAnon ? anonContext : context;
   if (!ctx) {
     throw new Error("No browser context available");
   }
-  
-  const page = await ctx.newPage();
-  
-  await page.route('**/*', (route) => {
+
+  // This request owns every auth context it creates; close them all when it
+  // returns/throws so concurrent requests never close each other's context.
+  const requestContexts: BrowserContext[] = [];
+  if (!useAnon && ctx) requestContexts.push(ctx);
+
+  const blockResources = (p: Page) => p.route('**/*', (route) => {
     const resourceType = route.request().resourceType();
     if (BLOCKED_RESOURCE_TYPES.includes(resourceType as any)) {
       route.abort();
@@ -413,7 +415,10 @@ async function getPage(
       route.continue();
     }
   });
-  
+
+  let page = await ctx.newPage();
+  await blockResources(page);
+
   try {
     let attempts = 0;
     const maxAttempts = 3;
@@ -444,6 +449,10 @@ async function getPage(
           const loggedIn = await performAutoLogin(userId);
           if (loggedIn) {
             await createContext(userId);
+            ctx = context!;
+            requestContexts.push(ctx);
+            page = await ctx.newPage();
+            await blockResources(page);
           }
           continue;
         }
@@ -461,12 +470,21 @@ async function getPage(
 
       const content = await page.content();
       console.log(`[Scraper] Firefox page fetched in ${Date.now() - startTime}ms total`);
-      return { page, content };
+      const release = async () => {
+        try { await page.close(); } catch {}
+        for (const c of requestContexts) {
+          try { await c.close(); } catch {}
+        }
+      };
+      return { page, content, release };
     }
 
     throw new Error("Failed to bypass Cloudflare after multiple attempts");
   } catch (error) {
-    await page.close();
+    try { await page.close(); } catch {}
+    for (const c of requestContexts) {
+      try { await c.close(); } catch {}
+    }
     throw error;
   }
 }
@@ -651,8 +669,8 @@ export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS
     return JSON.parse(cached);
   }
 
-  const { page, content } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, "[data-rr-expanded-fic-card]", userId);
-  if (page) await page.close();
+  const { page, content, release } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, "[data-rr-expanded-fic-card]", userId);
+  await release();
 
   const { document } = parseHTML(content);
   const fictions: FollowedFiction[] = [];
@@ -825,8 +843,8 @@ export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS
 }
 
 export async function getHistory(userId: string): Promise<HistoryEntry[]> {
-  const { page, content } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/history`, ".fiction-list", userId);
-  if (page) await page.close();
+  const { page, content, release } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/history`, ".fiction-list", userId);
+  await release();
 
   const { document } = parseHTML(content);
   const history: HistoryEntry[] = [];
@@ -886,8 +904,8 @@ export async function getReadLater(userId: string, ttl: number = CACHE_TTL.FOLLO
     return JSON.parse(cached);
   }
 
-  const { page, content } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/readlater`, "[data-rr-expanded-fic-card]", userId);
-  if (page) await page.close();
+  const { page, content, release } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/readlater`, "[data-rr-expanded-fic-card]", userId);
+  await release();
 
   const { document } = parseHTML(content);
   const fictions: Fiction[] = [];
@@ -965,8 +983,8 @@ export async function getToplist(toplist: ToplistType, userId?: string, ttl: num
     return JSON.parse(cached);
   }
 
-  const { page, content } = await getPage(toplist.url, ".fiction-list", userId);
-  if (page) await page.close();
+  const { page, content, release } = await getPage(toplist.url, ".fiction-list", userId);
+  await release();
 
   const fictions = parseFictionList(content);
   
@@ -995,7 +1013,7 @@ export async function getFiction(id: number, userId?: string, ttl: number = CACH
   }
 
   const url = `${ROYAL_ROAD_BASE_URL}/fiction/${id}`;
-  const { page, content } = await getPage(url, ".fic-title", userId);
+  const { page, content, release } = await getPage(url, ".fic-title", userId);
   
   // Try to get chapters from window.chapters variable (only works with browser)
   let chapters: Chapter[] = [];
@@ -1015,7 +1033,7 @@ export async function getFiction(id: number, userId?: string, ttl: number = CACH
     } catch (e) {
       console.log("Could not get chapters from JS, parsing HTML");
     }
-    await page.close();
+    await release();
   }
 
   const { document } = parseHTML(content);
@@ -1260,7 +1278,7 @@ export async function getChapter(
     }
   }
   
-  const { page, content } = await getPage(
+  const { page, content, release } = await getPage(
     `${ROYAL_ROAD_BASE_URL}/fiction/0/chapter/${chapterId}`, 
     ".chapter-content",
     isPreCaching ? undefined : userId
@@ -1315,7 +1333,7 @@ export async function getChapter(
       };
     });
 
-    await page.close();
+    await release();
   } else {
     // Parse navigation and fiction info from HTML (HTTP fetch path)
     const { document: doc } = parseHTML(content);
@@ -1506,8 +1524,8 @@ export async function getChapter(
 export async function validateCookies(userId: string): Promise<boolean> {
   try {
     await createContext(userId);
-    const { page, content } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, undefined, userId);
-    if (page) await page.close();
+    const { page, content, release } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, undefined, userId);
+    await release();
     
     const valid = !content.includes('action="/account/login"') && !content.includes("Sign In");
     
@@ -1516,8 +1534,8 @@ export async function validateCookies(userId: string): Promise<boolean> {
       const loggedIn = await performAutoLogin(userId);
       if (loggedIn) {
         await createContext(userId);
-        const { page: retryPage, content: retryContent } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, undefined, userId, true);
-        if (retryPage) await retryPage.close();
+        const { page: retryPage, content: retryContent, release: retryRelease } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, undefined, userId, true);
+        await retryRelease();
         return !retryContent.includes('action="/account/login"') && !retryContent.includes("Sign In");
       }
     }
@@ -1533,8 +1551,8 @@ export async function searchFictions(query: string, userId?: string): Promise<Fi
   const encodedQuery = encodeURIComponent(query);
   const searchUrl = `${ROYAL_ROAD_BASE_URL}/fictions/search?title=${encodedQuery}`;
   
-  const { page, content } = await getPage(searchUrl, ".fiction-list-item", userId);
-  if (page) await page.close();
+  const { page, content, release } = await getPage(searchUrl, ".fiction-list-item", userId);
+  await release();
   
   return parseFictionList(content);
 }
