@@ -651,18 +651,20 @@ export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS
     return JSON.parse(cached);
   }
 
-  const { page, content } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, ".fiction-list-item", userId);
+  const { page, content } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, "[data-rr-expanded-fic-card]", userId);
   if (page) await page.close();
 
   const { document } = parseHTML(content);
   const fictions: FollowedFiction[] = [];
 
-  const rows = document.querySelectorAll(".fiction-list-item");
+  // Royal Road redesigned /my/follows (Oct 2026): each entry is a
+  // [data-rr-expanded-fic-card] card instead of an old .fiction-list-item row.
+  const rows = document.querySelectorAll("[data-rr-expanded-fic-card]");
   console.log(`Found ${rows.length} fiction items`);
   
   for (const row of rows) {
     try {
-      const titleEl = row.querySelector("h2.fiction-title a");
+      const titleEl = row.querySelector("h2 a[href^='/fiction/']");
       if (!titleEl) continue;
 
       const href = titleEl.getAttribute("href") || "";
@@ -684,18 +686,18 @@ export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS
         }
       }
       
-      // Unread indicator
-      const hasUnread = !!row.querySelector("i.fa-circle");
-      
+      // Unread indicator (new design: red dot badge in the title row)
+      const hasUnread = !!row.querySelector("i.fa-circle") || row.innerHTML.includes("bg-danger");
+
       // Cover
-      const coverEl = row.querySelector("img[src*='covers'], img.thumbnail");
+      const coverEl = row.querySelector("img[data-type='cover'], img[src*='covers'], img.thumbnail");
       let coverUrl = coverEl?.getAttribute("src") || undefined;
       if (coverUrl && !coverUrl.startsWith("http")) {
         coverUrl = `https://www.royalroad.com${coverUrl}`;
       }
       
-      // Chapter info
-      const listItems = row.querySelectorAll("li.list-item");
+      // Chapter info (new design: plain <li> rows inside the card's <ul>)
+      const listItems = row.querySelectorAll("ul li");
       let latestChapter = "";
       let latestChapterId: number | undefined;
       let lastReadChapter = "";
@@ -707,7 +709,7 @@ export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS
       
       for (const li of listItems) {
         const chapterLink = li.querySelector("a[href*='/chapter/']");
-        const chapterNameEl = li.querySelector("a span.col-xs-8");
+        const chapterNameEl = li.querySelector("a span.col-xs-8") || li.querySelector("a span.flex-1");
         const chapterName = chapterNameEl?.textContent?.trim() || "";
         const chapterHref = chapterLink?.getAttribute("href") || "";
         const chapterIdMatch = chapterHref.match(/\/chapter\/(\d+)/);
@@ -740,18 +742,24 @@ export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS
       // Read button (next unread chapter)
       // Royal Road uses /chapter/next/{fictionId} which redirects to actual chapter
       let nextChapterUrl: string | undefined;
-      const readButton = row.querySelector("a.btn[href*='/chapter/']");
+      const readButton = row.querySelector("a.btn[href*='/chapter/']") || row.querySelector("a[href*='/chapter/next/']");
       if (readButton) {
         const readHref = readButton.getAttribute("href") || "";
         // Try direct chapter ID first (e.g., /chapter/123456)
         const directMatch = readHref.match(/\/chapter\/(\d+)$/);
         if (directMatch) {
           nextChapterId = parseInt(directMatch[1], 10);
-          nextChapterTitle = readButton.textContent?.trim() || undefined;
+          {
+            const t = readButton.textContent?.trim();
+            nextChapterTitle = t && !/^(read|continue|open|next)/i.test(t.replace(/\s+/g, " ")) ? t : (t && /chapter/i.test(t) && !/^open/i.test(t) ? t : undefined);
+          }
         } else if (readHref.includes("/chapter/next/")) {
           // Store the redirect URL to resolve later
           nextChapterUrl = readHref.startsWith("http") ? readHref : `${ROYAL_ROAD_BASE_URL}${readHref}`;
-          nextChapterTitle = readButton.textContent?.trim() || undefined;
+          {
+            const t = readButton.textContent?.trim();
+            nextChapterTitle = t && !/^(read|continue|open|next)/i.test(t.replace(/\s+/g, " ")) ? t : (t && /chapter/i.test(t) && !/^open/i.test(t) ? t : undefined);
+          }
         }
       }
 
@@ -878,21 +886,25 @@ export async function getReadLater(userId: string, ttl: number = CACHE_TTL.FOLLO
     return JSON.parse(cached);
   }
 
-  const { page, content } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/readlater`, ".fiction-list-item", userId);
+  const { page, content } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/readlater`, "[data-rr-expanded-fic-card]", userId);
   if (page) await page.close();
 
   const { document } = parseHTML(content);
   const fictions: Fiction[] = [];
 
-  const rows = document.querySelectorAll(".fiction-list-item");
+  // Same redesigned card markup as /my/follows.
+  const rows = document.querySelectorAll("[data-rr-expanded-fic-card]");
   console.log(`Found ${rows.length} read later items`);
 
   for (const row of rows) {
     try {
-      const titleEl = row.querySelector("h2.fiction-title a");
+      // New design: the fiction anchor wraps the <h2> (a[data-vt-trigger] > h2).
+      // Old-style follows markup has h2 > a instead, so try both.
+      const titleEl = row.querySelector("h2 a[href^='/fiction/']") || row.querySelector("a[data-vt-trigger] h2") || row.querySelector("h2");
       if (!titleEl) continue;
 
-      const href = titleEl.getAttribute("href") || "";
+      const titleAnchor = titleEl.closest("a[href^='/fiction/']") || titleEl.querySelector("a[href^='/fiction/']") || titleEl.parentElement?.closest("a");
+      const href = (titleAnchor?.getAttribute("href") || titleEl.getAttribute("href") || "").split("?")[0];
       const idMatch = href.match(/\/fiction\/(\d+)/);
       if (!idMatch) continue;
 
@@ -900,12 +912,12 @@ export async function getReadLater(userId: string, ttl: number = CACHE_TTL.FOLLO
       const title = titleEl.textContent?.trim() || "";
 
       let author = "";
-      const authorEl = row.querySelector("span.author a[href*='/profile/']");
+      const authorEl = row.querySelector("span.author a[href*='/profile/']") || row.querySelector("a[href*='/profile/']");
       if (authorEl) {
         author = authorEl.textContent?.trim() || "";
       }
 
-      const coverEl = row.querySelector("img[data-type='cover']");
+      const coverEl = row.querySelector("img[data-type='cover'], img[src*='covers'], img.thumbnail");
       let coverUrl = coverEl?.getAttribute("src") || undefined;
       if (coverUrl && !coverUrl.startsWith("http")) {
         coverUrl = `https://www.royalroad.com${coverUrl}`;
