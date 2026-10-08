@@ -62,10 +62,14 @@ const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image']
 // HTTP fetch user agent (same as Playwright context)
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// How long to sit on a Cloudflare challenge before giving up on it. A managed
-// challenge runs JS and can take tens of seconds on a cold browser, so this is
-// deliberately much longer than a selector timeout.
-const CHALLENGE_WAIT_MS = parseInt(process.env.ROYAL_ROAD_CHALLENGE_WAIT_MS || String(45 * 1000), 10);
+// How long to sit on a Cloudflare challenge before giving up on it.
+//
+// The budget is bounded by the reverse proxy, not by patience: Fly cuts a
+// request off around 120s, and a request that hangs for two minutes before
+// failing is worse than one that fails in thirty. Two attempts at 20s, plus
+// navigation, keeps the worst case near a minute.
+const CHALLENGE_WAIT_MS = parseInt(process.env.ROYAL_ROAD_CHALLENGE_WAIT_MS || String(20 * 1000), 10);
+const CHALLENGE_ATTEMPTS = 2;
 
 // ============ Cache keys ============
 
@@ -726,7 +730,7 @@ export async function getPage(
 
   try {
     let attempts = 0;
-    const maxAttempts = 3;
+    const maxAttempts = CHALLENGE_ATTEMPTS;
 
     while (attempts < maxAttempts) {
       attempts++;
