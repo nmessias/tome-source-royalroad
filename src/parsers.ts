@@ -192,16 +192,21 @@ export function shouldPrependTitle(title: string, htmlContent: string): boolean 
 
 /**
  * Phrases Royal Road injects beside the story text to poison copies.
- * Matched case-insensitively against element text.
+ *
+ * Deliberately narrow: an element matching one of these is deleted, so a
+ * pattern broad enough to catch ordinary prose would delete story text. Every
+ * entry therefore requires piracy context ("has been stolen", "without
+ * authorization", ...) rather than a fragment like "report any sightings",
+ * which a story could legitimately contain.
  */
 const ANTI_PIRACY_PATTERNS: RegExp[] = [
-  /purloined without the author'?s approval/i,
-  /this (?:narrative|story) has been (?:purloined|stolen)/i,
-  /report (?:the violation|any appearances)/i,
-  /if you (?:discover|find) this (?:narrative|story) on amazon/i,
-  /posted elsewhere by the author/i,
-  /reading the authentic version/i,
-  /been stolen\.?\s*please report/i,
+  /purloined/i,
+  /\b(?:has|have) been (?:taken|stolen|purloined|pirated)\b/i,
+  /\bwithout (?:the )?author(?:'?s)? (?:authorization|consent|permission|approval)\b/i,
+  /\bwithout (?:authorization|consent|permission)\b/i,
+  /\bposted elsewhere by the author\b/i,
+  /\breading the authentic version\b/i,
+  /\bon amazon, be aware\b/i,
 ];
 
 /**
@@ -279,6 +284,37 @@ export function cleanObfuscatedClasses(root: Element): void {
     if (classes.length) el.setAttribute('class', classes.join(' '));
     else el.removeAttribute('class');
   }
+}
+
+// ============ Cloudflare challenge ============
+
+/**
+ * Markers for a Cloudflare interstitial.
+ *
+ * The set this plugin used for a long time (challenge-running,
+ * cf-browser-verification, cf-turnstile) matches **nothing** in the current
+ * interstitial: it is a bare "Just a moment..." shell that loads its challenge
+ * in JS, so those strings only exist post-execution. A `page.content()` taken
+ * right after domcontentloaded returned that shell, it sailed through as real
+ * content, and the failure surfaced much later as a confusing "returned a page
+ * without chapter content".
+ */
+const CHALLENGE_MARKERS = [
+  "challenge-running",
+  "cf-browser-verification",
+  "cf-turnstile",
+  "challenges.cloudflare.com",
+  "cf_chl_opt",
+  "cf-challenge",
+  "Checking your browser",
+  "Enable JavaScript and cookies to continue",
+  "Attention Required",
+  "Just a moment",
+];
+
+/** True when the HTML is a Cloudflare challenge rather than a Royal Road page. */
+export function looksLikeChallenge(html: string): boolean {
+  return CHALLENGE_MARKERS.some((marker) => html.includes(marker));
 }
 
 // ============ Generic card/row helpers ============

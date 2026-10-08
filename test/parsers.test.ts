@@ -14,6 +14,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+const { parseHTML } = require("linkedom");
 import {
   parseFictionList,
   parseFictionPage,
@@ -26,6 +27,7 @@ import {
   cleanObfuscatedClasses,
   normalizeText,
   extractCoreTitle,
+  looksLikeChallenge,
 } from "../src/parsers";
 
 const fixture = (name: string) =>
@@ -154,11 +156,82 @@ describe("stripAntiPiracy", () => {
     stripAntiPiracy(document.querySelector("div")!, []);
     expect(document.querySelector("div")!.textContent).toContain("Amazon");
   });
+
+  // Royal Road rotates the notice wording; a filter pinned to one phrasing
+  // leaks the next one straight into the reader.
+  test("removes the notices seen in the wild", () => {
+    const notices = [
+      "This narrative has been purloined without the author's approval. Report any appearances on Amazon.",
+      "If you discover this narrative on Amazon, be aware that it has been stolen. Please report the violation.",
+      "This story is posted elsewhere by the author. Help them out by reading the authentic version.",
+      "This story has been taken without authorization. Report any sightings.",
+    ];
+    for (const notice of notices) {
+      const { document } = parseHTML(`<div><p>${notice}</p></div>`);
+      stripAntiPiracy(document.querySelector("div")!, []);
+      expect(document.querySelector("div")!.textContent?.trim()).toBe("");
+    }
+  });
+
+  // The patterns require piracy context, so ordinary prose that happens to
+  // contain a fragment like "report any sightings" survives.
+  test("keeps prose that shares a fragment of the notice", () => {
+    const prose = "Report any sightings of the beast to the guild hall before nightfall.";
+    const { document } = parseHTML(`<div><p>${prose}</p></div>`);
+    stripAntiPiracy(document.querySelector("div")!, []);
+    expect(document.querySelector("div")!.textContent).toContain("sightings");
+  });
+});
+
+// ============ Cloudflare challenge detection ============
+
+describe("looksLikeChallenge", () => {
+  // Regression: the plugin used three markers (challenge-running,
+  // cf-browser-verification, cf-turnstile) that appear **zero** times in
+  // Cloudflare's current interstitial. A challenge page therefore passed as
+  // real content and only failed much later as "returned a page without
+  // chapter content".
+  test("detects the real captured interstitial", () => {
+    const challenge = fixture("cloudflare-challenge.html");
+    // Confirm the premise: the old markers really are absent.
+    expect(challenge).not.toContain("challenge-running");
+    expect(challenge).not.toContain("cf-browser-verification");
+    expect(challenge).not.toContain("cf-turnstile");
+    expect(looksLikeChallenge(challenge)).toBe(true);
+  });
+
+  test("detects an interstitial with only the title to go on", () => {
+    const shell = `<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title>
+      <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+      <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+      <script>window._cf_chl_opt={cvId: "3"};</script></head><body class="no-js"></body></html>`;
+    expect(looksLikeChallenge(shell)).toBe(true);
+  });
+
+  test("still detects the older markers", () => {
+    expect(looksLikeChallenge("<div id='challenge-running'></div>")).toBe(true);
+    expect(looksLikeChallenge("<div class='cf-browser-verification'></div>")).toBe(true);
+    expect(looksLikeChallenge("<div id='cf-turnstile'></div>")).toBe(true);
+  });
+
+  test("detects the block page", () => {
+    expect(looksLikeChallenge("<title>Attention Required. | Cloudflare</title>")).toBe(true);
+  });
+
+  // A false positive here would make every real page look blocked.
+  test("does not fire on a real Royal Road page", () => {
+    expect(looksLikeChallenge(fixture("chapter.html"))).toBe(false);
+    expect(looksLikeChallenge(fixture("fiction.html"))).toBe(false);
+    expect(looksLikeChallenge(fixture("toplist.html"))).toBe(false);
+  });
+
+  test("does not fire on an empty or login page", () => {
+    expect(looksLikeChallenge("")).toBe(false);
+    expect(looksLikeChallenge("<title>Sign In | Royal Road</title><form></form>")).toBe(false);
+  });
 });
 
 describe("cleanObfuscatedClasses", () => {
-  const { parseHTML } = require("linkedom");
-
   test("strips Royal Road's cn/cj obfuscation names", () => {
     const { document } = parseHTML('<div><p class="cn' + "A".repeat(30) + '">x</p></div>');
     cleanObfuscatedClasses(document.querySelector("div")!);

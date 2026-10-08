@@ -34,6 +34,7 @@ import { performAutoLogin, ROYAL_ROAD_AUTO_LOGIN_ENABLED } from "./royalroad-aut
 import {
   FICTION_CARD_WAIT_SELECTOR,
   HISTORY_ROW_SELECTOR,
+  looksLikeChallenge,
   parseFictionList,
   parseFictionPage,
   parseChapterPage,
@@ -182,11 +183,7 @@ async function tryHttpFetch(
     const html = await response.text();
 
     // Check for Cloudflare challenge
-    if (
-      html.includes("challenge-running") ||
-      html.includes("cf-browser-verification") ||
-      html.includes("cf-turnstile")
-    ) {
+    if (looksLikeChallenge(html)) {
       console.log(`[Scraper] Cloudflare challenge detected in ${Date.now() - startTime}ms, need browser`);
       return null;
     }
@@ -490,13 +487,27 @@ export async function performBrowserLogin(userId: string, opts: { force?: boolea
  */
 function assertHasContent(label: string, content: string, probe: RegExp): void {
   if (probe.test(content)) return;
+
+  // A challenge that never cleared is a different problem from a locked
+  // chapter, and the user needs to be able to tell them apart.
+  if (looksLikeChallenge(content)) {
+    const title = (content.match(/<title>([\s\S]*?)<\/title>/i)?.[1] || "")
+      .replace(/\s+/g, ' ')
+      .trim();
+    throw new Error(
+      `Cloudflare did not let the request through for ${label}` +
+      (title ? ` (page: "${title}")` : "") +
+      `. This is usually transient — reload in a moment.`
+    );
+  }
+
   const title = (content.match(/<title>([\s\S]*?)<\/title>/i)?.[1] || "")
     .replace(/\s+/g, ' ')
     .trim();
   throw new Error(
     `Royal Road returned a page without ${label}` +
     (title ? ` (title: "${title}")` : "") +
-    `. This is usually a transient Cloudflare block — retrying normally works.`
+    `. The chapter may be removed, or subscriber-only.`
   );
 }
 
@@ -528,7 +539,30 @@ export interface GetPageOptions {
   allowAnonymous?: boolean;
 }
 
-export async function getPage(
+export /**
+ * Wait for an in-flight Cloudflare challenge to finish, in place.
+ *
+ * Re-navigating restarts the challenge and burns an attempt, so the page is
+ * left alone and its title polled until it stops naming a challenge.
+ */
+async function waitForChallengeToClear(page: Page): Promise<boolean> {
+  const deadline = Date.now() + SCRAPER_SELECTOR_TIMEOUT;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(1000);
+    try {
+      const title = await page.title();
+      if (!/just a moment|attention required|checking your browser|cloudflare/i.test(title)) {
+        return true;
+      }
+    } catch {
+      // Page navigated underneath us — that is the challenge clearing.
+      return true;
+    }
+  }
+  return false;
+}
+
+async function getPage(
   url: string,
   waitForSelector?: string,
   userId?: string,
@@ -650,15 +684,22 @@ export async function getPage(
       });
       console.log(`[Scraper] Navigation completed in ${Date.now() - navStart}ms`);
 
-      const pageContent = await page.content();
-      if (
-        pageContent.includes("challenge-running") ||
-        pageContent.includes("cf-browser-verification") ||
-        pageContent.includes("cf-turnstile")
-      ) {
-        console.log("[Scraper] Cloudflare challenge detected, waiting 5s...");
-        await page.waitForTimeout(5000);
-        continue;
+      let pageContent = await page.content();
+
+      // Cloudflare's current interstitial is a bare "Just a moment..." shell
+      // that loads its challenge in JS, so the old markers above match nothing
+      // and a content snapshot taken right after domcontentloaded can catch the
+      // pre-redirect page. Let the challenge finish in place, then re-read —
+      // a fresh goto would restart it and burn an attempt.
+      if (looksLikeChallenge(pageContent)) {
+        console.log(`[Scraper] Cloudflare challenge on ${url} (attempt ${attempts}), waiting for it to clear...`);
+        await waitForChallengeToClear(page);
+        pageContent = await page.content();
+
+        if (looksLikeChallenge(pageContent)) {
+          if (attempts >= maxAttempts) break;
+          continue;
+        }
       }
 
       if (looksLikeLoginPage(pageContent, page.url())) {
