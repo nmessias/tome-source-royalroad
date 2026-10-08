@@ -2,7 +2,7 @@
  * Background jobs for cache warming
  */
 import { isCached } from "tome";
-import { hasRoyalRoadSession } from "./royalroad-credentials";
+import { hasRoyalRoadSession, isSessionKnownDead } from "./royalroad-credentials";
 import { CACHE_TTL } from "tome";
 import { TOPLISTS } from "./config";
 import { Database } from "bun:sqlite";
@@ -12,10 +12,19 @@ let jobsRunning = false;
 let followsJobInterval: ReturnType<typeof setInterval> | null = null;
 let toplistsJobInterval: ReturnType<typeof setInterval> | null = null;
 
+// One connection for the process, shared by every job. Opening a database per
+// call leaked a handle each time and serialised the jobs behind SQLite's
+// file lock.
+let db: Database | null = null;
+function getDb(): Database {
+  if (!db) db = new Database(DB_PATH);
+  return db;
+}
+
 function getAdminUserId(): string | null {
-  const db = new Database(DB_PATH);
-  const admin = db.query("SELECT id FROM user WHERE role = 'admin' LIMIT 1").get() as { id: string } | null;
-  db.close();
+  const admin = getDb()
+    .query("SELECT id FROM user WHERE role = 'admin' LIMIT 1")
+    .get() as { id: string } | null;
   return admin?.id ?? null;
 }
 
@@ -41,6 +50,13 @@ async function warmFollowsCache(): Promise<void> {
   
   if (!hasRoyalRoadSession(adminUserId)) {
     console.log("[Job] Skipping follows cache - no session cookies");
+    return;
+  }
+
+  // A session we already know is dead only produces a login page, so burning a
+  // browser navigation every twenty minutes to re-learn that is pointless.
+  if (isSessionKnownDead(adminUserId)) {
+    console.log("[Job] Skipping follows cache - session is known to be expired");
     return;
   }
 
@@ -187,6 +203,8 @@ export function stopJobs(): void {
     toplistsJobInterval = null;
   }
   jobsRunning = false;
+  try { db?.close(); } catch {}
+  db = null;
   console.log("[Job] Background jobs stopped");
 }
 

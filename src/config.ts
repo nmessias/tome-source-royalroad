@@ -27,6 +27,22 @@ export const ROYAL_ROAD_AUTO_LOGIN_ENABLED = !!(ROYAL_ROAD_USERNAME && ROYAL_ROA
 export const SCRAPER_TIMEOUT = 60000;  // 60 seconds for navigation
 export const SCRAPER_SELECTOR_TIMEOUT = 20000;  // 20 seconds for selectors
 
+// Chapter content cache. Royal Road authors edit published chapters, and the
+// core default of 30 days makes a corrected chapter invisible for a month, so
+// the plugin uses its own shorter window. Override in days via env.
+const CHAPTER_CACHE_DAYS = parseInt(process.env.ROYAL_ROAD_CHAPTER_TTL_DAYS || "7", 10);
+export const CHAPTER_CACHE_TTL = Math.max(1, CHAPTER_CACHE_DAYS) * 24 * 60 * 60;
+
+// Search results are public and change slowly; caching them keeps a search
+// from costing a Playwright navigation every time the form is submitted.
+export const SEARCH_CACHE_TTL = 5 * 60;
+
+// How long a failed *automatic* login suppresses further attempts. Cloudflare
+// challenging one login POST poisons the browser session for a while, so a
+// background retry storm makes things worse. An explicit user action (the
+// Settings > Refresh session button) bypasses this entirely.
+export const AUTO_LOGIN_COOLDOWN_MS = parseInt(process.env.ROYAL_ROAD_LOGIN_COOLDOWN_MS || String(5 * 60 * 1000), 10);
+
 // Toplists configuration
 export const TOPLISTS: ToplistType[] = [
   { slug: 'rising-stars', name: 'Rising Stars', url: `${ROYAL_ROAD_BASE_URL}/fictions/rising-stars` },

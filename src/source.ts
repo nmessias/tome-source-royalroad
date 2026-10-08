@@ -24,6 +24,7 @@ import {
   hasRoyalRoadSession,
   setRoyalRoadCookie,
   clearRoyalRoadCookies,
+  clearSessionState,
 } from "./royalroad-credentials";
 import { performAutoLogin, ROYAL_ROAD_AUTO_LOGIN_ENABLED } from "./royalroad-auth";
 import { performBrowserLogin } from "./scraper";
@@ -151,6 +152,9 @@ export const royalroadSource: Source = {
     if (values.cfclearance?.trim()) {
       setRoyalRoadCookie(userId, "cf_clearance", values.cfclearance.trim());
     }
+    // A pasted cookie is assumed good until proven otherwise; drop any stale
+    // "known dead" verdict from the previous session.
+    clearSessionState(userId);
     await createContext(userId);
     const valid = await validateCookies(userId);
     if (valid) {
@@ -161,6 +165,7 @@ export const royalroadSource: Source = {
   },
   async clearCredentials(userId) {
     clearRoyalRoadCookies(userId);
+    clearSessionState(userId);
     clearCache();
     await createContext(userId);
   },
@@ -171,11 +176,14 @@ export const royalroadSource: Source = {
     enabled: ROYAL_ROAD_AUTO_LOGIN_ENABLED,
     async refresh(userId) {
       // Cloudflare blocks the HTTP login from datacenter IPs, so prefer the
-      // browser login whenever the browser fallback is available.
+      // browser login whenever the browser fallback is available. `force`
+      // skips the automatic attempt backoff: this is the user pressing the
+      // button, not a background retry storm.
       const ok = ENABLE_BROWSER
-        ? await performBrowserLogin(userId)
+        ? await performBrowserLogin(userId, { force: true })
         : await performAutoLogin(userId);
       if (!ok) return false;
+      clearSessionState(userId);
       await createContext(userId);
       await validateCookies(userId);
       triggerCacheWarm().catch(console.error);

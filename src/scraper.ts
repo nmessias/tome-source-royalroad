@@ -1,20 +1,52 @@
 /**
  * Hybrid HTTP + Playwright scraper for Royal Road
- * Tries fast HTTP fetch first, falls back to Firefox for Cloudflare challenges
+ * Tries fast HTTP fetch first, falls back to a real browser for Cloudflare challenges
  * Browser fallback can be disabled via ENABLE_BROWSER=false to save resources
+ *
+ * All HTML parsing lives in ./parsers so it stays pure and testable.
  */
 import { parseHTML } from "linkedom";
 import { getCache, setCache, deleteCache } from "tome";
-import { getRoyalRoadCookiesForPlaywright, hasRoyalRoadSession, setRoyalRoadCookie } from "./royalroad-credentials";
 import { CACHE_TTL } from "tome";
-import { ROYAL_ROAD_BASE_URL, ROYAL_ROAD_USERNAME, ROYAL_ROAD_PASSWORD, BROWSER_ENGINE, BROWSER_HEADLESS, SCRAPER_TIMEOUT, SCRAPER_SELECTOR_TIMEOUT, ENABLE_BROWSER } from "./config";
+import {
+  getRoyalRoadCookiesForPlaywright,
+  hasRoyalRoadSession,
+  setRoyalRoadCookie,
+  markSessionDead,
+  clearSessionState,
+  isSessionKnownDead,
+} from "./royalroad-credentials";
+import { deleteCacheByPrefix } from "./cache";
+import {
+  ROYAL_ROAD_BASE_URL,
+  ROYAL_ROAD_USERNAME,
+  ROYAL_ROAD_PASSWORD,
+  SCRAPER_TIMEOUT,
+  SCRAPER_SELECTOR_TIMEOUT,
+  ENABLE_BROWSER,
+  BROWSER_ENGINE,
+  BROWSER_HEADLESS,
+  CHAPTER_CACHE_TTL,
+  SEARCH_CACHE_TTL,
+  AUTO_LOGIN_COOLDOWN_MS,
+} from "./config";
 import { performAutoLogin, ROYAL_ROAD_AUTO_LOGIN_ENABLED } from "./royalroad-auth";
+import {
+  FICTION_CARD_WAIT_SELECTOR,
+  HISTORY_ROW_SELECTOR,
+  parseFictionList,
+  parseFictionPage,
+  parseChapterPage,
+  parseCards,
+  parseHistoryPage,
+  type ParsedCard,
+} from "./parsers";
 
 // Playwright types (imported dynamically when ENABLE_BROWSER=true)
 type Browser = import("playwright").Browser;
 type BrowserContext = import("playwright").BrowserContext;
 type Page = import("playwright").Page;
-import type { Fiction, FollowedFiction, Chapter, ChapterContent, ToplistType, HistoryEntry } from "tome";
+import type { Fiction, FollowedFiction, ChapterContent, ToplistType, HistoryEntry } from "tome";
 
 // Resource types to block for faster page loads (keep images for covers)
 // Everything the parser does not need. Images are the big one: a follows page
@@ -23,163 +55,58 @@ import type { Fiction, FollowedFiction, Chapter, ChapterContent, ToplistType, Hi
 // bandwidth (and it makes Cloudflare challenges slower to settle).
 const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image'] as const;
 
-// Number words for normalization (chapter titles like "Chapter Forty-Seven")
-const NUMBER_WORDS: Record<string, string> = {
-  zero: "0", one: "1", two: "2", three: "3", four: "4", five: "5",
-  six: "6", seven: "7", eight: "8", nine: "9", ten: "10",
-  eleven: "11", twelve: "12", thirteen: "13", fourteen: "14", fifteen: "15",
-  sixteen: "16", seventeen: "17", eighteen: "18", nineteen: "19", twenty: "20",
-  thirty: "30", forty: "40", fifty: "50", sixty: "60", seventy: "70",
-  eighty: "80", ninety: "90", hundred: "100",
-};
-
-/**
- * Normalize text for fuzzy matching:
- * - Lowercase
- * - Convert number words to digits
- * - Remove punctuation
- * - Collapse whitespace
- */
-function normalizeText(text: string): string {
-  let normalized = text.toLowerCase();
-  
-  // Convert number words to digits (e.g., "forty-seven" -> "40-7" -> "407")
-  // Handle compound numbers like "forty-seven" or "forty seven"
-  for (const [word, digit] of Object.entries(NUMBER_WORDS)) {
-    normalized = normalized.replace(new RegExp(`\\b${word}\\b`, 'gi'), digit);
-  }
-  
-  // Remove punctuation except spaces
-  normalized = normalized.replace(/[^\w\s]/g, ' ');
-  
-  // Collapse whitespace
-  normalized = normalized.replace(/\s+/g, ' ').trim();
-  
-  return normalized;
-}
-
-/**
- * Extract the "core" title by stripping common chapter prefixes
- * e.g., "Chapter 47: The Battle Begins" -> "the battle begins"
- * e.g., "Ch. 12 - Awakening" -> "awakening"
- */
-function extractCoreTitle(title: string): string {
-  const normalized = normalizeText(title);
-  
-  // Common chapter prefix patterns to strip
-  const prefixPatterns = [
-    /^chapter\s+\d+\s*[:\-–—]\s*/i,      // "Chapter 47: " or "Chapter 47 - "
-    /^chapter\s+\d+\s*/i,                 // "Chapter 47 "
-    /^ch\.?\s*\d+\s*[:\-–—]\s*/i,         // "Ch. 12: " or "Ch 12 - "
-    /^ch\.?\s*\d+\s*/i,                   // "Ch. 12 "
-    /^\d+\s*[:\-–—\.]\s*/i,               // "47: " or "47. " or "47 - "
-    /^part\s+\d+\s*[:\-–—]\s*/i,          // "Part 3: "
-    /^book\s+\d+\s*[:\-–—]\s*/i,          // "Book 2: "
-    /^arc\s+\d+\s*[:\-–—]\s*/i,           // "Arc 1: "
-    /^episode\s+\d+\s*[:\-–—]\s*/i,       // "Episode 5: "
-    /^prologue\s*[:\-–—]?\s*/i,           // "Prologue: "
-    /^epilogue\s*[:\-–—]?\s*/i,           // "Epilogue: "
-    /^interlude\s*[:\-–—]?\s*/i,          // "Interlude: "
-  ];
-  
-  let core = normalized;
-  for (const pattern of prefixPatterns) {
-    core = core.replace(pattern, '');
-  }
-  
-  return core.trim();
-}
-
-/**
- * Extract text content from first N block elements or first N characters of HTML
- */
-/**
- * Extract text from the FIRST block-level element of the content.
- * A title duplicate, when it exists, is always the opening element — not a
- * word buried a few sentences in (which is just the story beginning).
- */
-function extractFirstBlock(html: string): string {
-  const { document } = parseHTML(`<div>${html}</div>`);
-  const root = document.querySelector('div');
-  if (!root) return '';
-  const first = root.querySelector('p, div, h1, h2, h3, h4, h5, h6');
-  return first?.textContent?.trim() ?? '';
-}
-
-/**
- * True when `text` opens with `title` — identical, or the title followed by a
- * word boundary. A leading, near-exact match: the only case where the content
- * genuinely restates the title as its opening.
- */
-function startsWithTitle(text: string, title: string): boolean {
-  if (!title) return false;
-  return text === title || text.startsWith(title + ' ');
-}
-
-/**
- * Decide whether to prepend a title heading into the chapter body.
- * Suppress ONLY when the content already opens with a literal restatement of
- * the title (its full form, or its "core" title after stripping "Chapter N"
- * prefixes). A title word showing up later in the body is just the story
- * beginning, so the title is still prepended — the reader header is hidden
- * while reading, so the in-content heading is what the user actually sees.
- */
-export function shouldPrependTitle(title: string, htmlContent: string): boolean {
-  if (!title || !htmlContent) return true;
-  const normalizedTitle = normalizeText(title);
-  const coreTitle = extractCoreTitle(title);
-  const firstBlock = normalizeText(extractFirstBlock(htmlContent));
-
-  return !(
-    startsWithTitle(firstBlock, normalizedTitle) ||
-    (coreTitle && coreTitle !== normalizedTitle && startsWithTitle(firstBlock, coreTitle))
-  );
-}
-
-/**
- * Escape HTML entities in a string
- */
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
-}
-
 // HTTP fetch user agent (same as Playwright context)
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+// ============ Cache keys ============
+
 /**
- * Execute async functions with limited concurrency
- * Prevents overwhelming the server with too many parallel requests
+ * Core's published `FollowedFiction` (the `tome` package this plugin resolves)
+ * lags behind the recency fields Tome's follows card already renders. They are
+ * plain optional properties on the same object, so declaring them locally keeps
+ * the plugin compiling against any core revision.
  */
+export type FollowedFictionWithRecency = FollowedFiction & {
+  lastUpdateAgo?: string;
+  lastReadAgo?: string;
+};
+
+/**
+ * Fiction pages are cached per user: they carry the antiforgery token and the
+ * reader's own follow/read state, so one user's row must never be served to
+ * another. `fiction:<id>:<userId>` also lets a single fiction be invalidated
+ * for everyone with a prefix delete.
+ */
+function fictionCacheKey(id: number | string, userId?: string): string {
+  return `fiction:${id}:${userId ?? "anon"}`;
+}
+
+// ============ Small helpers ============
+
 async function parallelLimit<T>(
   items: T[],
   limit: number,
   fn: (item: T) => Promise<void>
 ): Promise<void> {
   const executing: Promise<void>[] = [];
-  
+
   for (const item of items) {
     const p = fn(item).then(() => {
       executing.splice(executing.indexOf(p), 1);
     });
     executing.push(p);
-    
+
     if (executing.length >= limit) {
       await Promise.race(executing);
     }
   }
-  
+
   await Promise.all(executing);
 }
 
-/**
- * Get cookies formatted as HTTP Cookie header string for a specific user
- */
-function getCookiesForFetch(userId: string): string {
+/** Cookies formatted as an HTTP Cookie header string for a specific user. */
+function getCookiesForFetch(userId?: string): string {
+  if (!userId) return "";
   const cookies = getRoyalRoadCookiesForPlaywright(userId);
   return cookies.map((c: { name: string; value: string }) => `${c.name}=${c.value}`).join("; ");
 }
@@ -203,47 +130,69 @@ async function rememberCookiesFromBrowser(ctx: BrowserContext, userId?: string):
 }
 
 /**
- * Try fetching page via HTTP first (fast path, ~100ms)
- * Returns HTML content if successful, null if Cloudflare blocked or error
+ * True when a fetched page is Royal Road's login page — i.e. the session was
+ * rejected. Called on the *body* as well as the final URL because the redirect
+ * to /account/login is not always visible in `response.url`.
  */
-async function tryHttpFetch(url: string, userId?: string, alreadyRetriedWithLogin?: boolean): Promise<{ content: string; finalUrl: string } | null> {
+function looksLikeLoginPage(html: string, finalUrl?: string): boolean {
+  return (
+    !!finalUrl?.includes("/account/login") ||
+    html.includes('action="/account/login"') ||
+    /<title>\s*Sign In\s*\|/i.test(html)
+  );
+}
+
+// ============ HTTP fast path ============
+
+/**
+ * Try fetching a page via HTTP first (fast path, ~100ms).
+ * Returns the HTML if it looks like the real page, null when Cloudflare blocks
+ * it or the session was rejected.
+ */
+async function tryHttpFetch(
+  url: string,
+  userId?: string,
+  alreadyRetriedWithLogin?: boolean
+): Promise<{ content: string; finalUrl: string } | null> {
   const startTime = Date.now();
-  
+
   try {
     const headers: Record<string, string> = {
       "User-Agent": USER_AGENT,
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "en-US,en;q=0.5",
     };
-    
+
     if (userId) {
       const cookieHeader = getCookiesForFetch(userId);
-      if (cookieHeader) {
-        headers["Cookie"] = cookieHeader;
-      }
+      if (cookieHeader) headers["Cookie"] = cookieHeader;
     }
-    
+
     const response = await fetch(url, {
       method: "GET",
       headers,
       redirect: "follow",
     });
-    
+
     if (!response.ok) {
       console.log(`[Scraper] HTTP fetch failed: ${response.status} in ${Date.now() - startTime}ms`);
       return null;
     }
-    
+
     const html = await response.text();
-    
+
     // Check for Cloudflare challenge
-    if (html.includes("challenge-running") || html.includes("cf-browser-verification") || html.includes("cf-turnstile")) {
+    if (
+      html.includes("challenge-running") ||
+      html.includes("cf-browser-verification") ||
+      html.includes("cf-turnstile")
+    ) {
       console.log(`[Scraper] Cloudflare challenge detected in ${Date.now() - startTime}ms, need browser`);
       return null;
     }
-    
+
     // Check for login redirect (cookies not working)
-    if (html.includes('action="/account/login"') || response.url.includes("/account/login")) {
+    if (looksLikeLoginPage(html, response.url)) {
       console.warn("[Scraper] HTTP fetch got login page - cookies may be invalid or expired");
       if (userId && !alreadyRetriedWithLogin && ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
         console.log("[Scraper] Attempting auto-login before retry...");
@@ -252,9 +201,10 @@ async function tryHttpFetch(url: string, userId?: string, alreadyRetriedWithLogi
           return tryHttpFetch(url, userId, true);
         }
       }
+      if (userId) markSessionDead(userId);
       return null;
     }
-    
+
     console.log(`[Scraper] HTTP fetch succeeded in ${Date.now() - startTime}ms`);
     return { content: html, finalUrl: response.url };
   } catch (error) {
@@ -263,13 +213,23 @@ async function tryHttpFetch(url: string, userId?: string, alreadyRetriedWithLogi
   }
 }
 
+// ============ Browser lifecycle ============
+
 let browser: Browser | null = null;
 let context: BrowserContext | null = null;
 let anonContext: BrowserContext | null = null;
 
+/**
+ * Auth contexts currently owned by an in-flight request. `createContext`
+ * replaces the shared slot on every call (Settings save, cookie validation,
+ * auto-login refresh), and must not close a context a concurrent request is
+ * still reading pages from.
+ */
+const inFlightContexts = new Set<BrowserContext>();
+
 async function ensureBrowser(): Promise<void> {
   if (!ENABLE_BROWSER) return;
-  
+
   if (!browser || !browser.isConnected()) {
     if (browser) {
       console.log("Browser disconnected, reinitializing...");
@@ -286,44 +246,56 @@ export async function initBrowser(): Promise<void> {
     console.log("Browser disabled (ENABLE_BROWSER=false)");
     return;
   }
-  
+
   if (browser) return;
 
   console.log(`Initializing ${BROWSER_ENGINE} browser (headless=${BROWSER_HEADLESS})...`);
   const startTime = Date.now();
 
-  if (BROWSER_ENGINE === "chromium") {
-    // channel "chromium" selects the full browser build; Playwright's default
-    // is chromium-headless-shell, which Cloudflare fingerprints easily.
-    const { chromium } = await import("playwright");
-    browser = await chromium.launch({
-      channel: "chromium",
-      headless: BROWSER_HEADLESS,
-      args: [
-        // Makes navigator.webdriver false, so the stealth init script is only
-        // belt-and-braces.
-        "--disable-blink-features=AutomationControlled",
-        "--no-sandbox",
-      ],
-    });
-    console.log(`Chromium launched in ${Date.now() - startTime}ms`);
-  } else {
-    const { firefox } = await import("playwright");
-    browser = await firefox.launch({
-      headless: true,
-      firefoxUserPrefs: {
-        "browser.cache.disk.enable": false,
-        "browser.cache.memory.enable": true,
-        "browser.cache.memory.capacity": 32768,
-        "browser.sessionhistory.max_entries": 2,
-        "browser.sessionstore.max_tabs_undo": 0,
-        "media.autoplay.enabled": false,
-        "media.peerconnection.enabled": false,
-        "dom.webnotifications.enabled": false,
-        "geo.enabled": false,
-      },
-    });
-    console.log(`Firefox launched in ${Date.now() - startTime}ms`);
+  try {
+    if (BROWSER_ENGINE === "chromium") {
+      // channel "chromium" selects the full browser build; Playwright's default
+      // is chromium-headless-shell, which Cloudflare fingerprints easily.
+      const { chromium } = await import("playwright");
+      browser = await chromium.launch({
+        channel: "chromium",
+        headless: BROWSER_HEADLESS,
+        args: [
+          // Makes navigator.webdriver false, so the stealth init script is only
+          // belt-and-braces.
+          "--disable-blink-features=AutomationControlled",
+          "--no-sandbox",
+        ],
+      });
+      console.log(`Chromium launched in ${Date.now() - startTime}ms`);
+    } else {
+      const { firefox } = await import("playwright");
+      browser = await firefox.launch({
+        headless: true,
+        firefoxUserPrefs: {
+          "browser.cache.disk.enable": false,
+          "browser.cache.memory.enable": true,
+          "browser.cache.memory.capacity": 32768,
+          "browser.sessionhistory.max_entries": 2,
+          "browser.sessionstore.max_tabs_undo": 0,
+          "media.autoplay.enable": false,
+          "media.peerconnection.enable": false,
+          "dom.webnotifications.enable": false,
+          "geo.enabled": false,
+        },
+      });
+      console.log(`Firefox launched in ${Date.now() - startTime}ms`);
+    }
+  } catch (error) {
+    browser = null;
+    console.error(
+      `[Scraper] Failed to launch ${BROWSER_ENGINE}: ${(error as Error).message}\n` +
+      `  Cloudflare blocks plain HTTP from datacenter IPs, so without a browser ` +
+      `every page needs one. Chromium must run headful (ROYAL_ROAD_HEADLESS is ` +
+      `${BROWSER_HEADLESS ? "true" : "false"}), which in a container means Xvfb ` +
+      `with DISPLAY set - scripts/start.sh does this automatically.`
+    );
+    throw error;
   }
 
   await createAnonContext();
@@ -336,12 +308,16 @@ export async function createContext(userId: string): Promise<void> {
     return;
   }
 
-  // Do NOT close the previous shared context here: a concurrent in-flight
-  // request may still hold open pages on it. Each getPage() call owns and
-  // closes the context(s) it creates instead.
+  // Close the context this slot held previously, but only when no in-flight
+  // request still owns it - otherwise a concurrent page load gets torn down
+  // mid-navigation.
+  if (context && !inFlightContexts.has(context)) {
+    try { await context.close(); } catch {}
+  }
+
   const cookies = getRoyalRoadCookiesForPlaywright(userId);
   console.log(`Creating context with ${cookies.length} cookies: ${cookies.map((c: { name: string }) => c.name).join(", ")}`);
-  
+
   // No userAgent override: claiming a Chrome UA from a Firefox build (or from a
   // Chromium whose real version differs) is a fingerprint mismatch that makes
   // Cloudflare reject requests. Let the browser report itself.
@@ -386,27 +362,19 @@ async function createAnonContext(): Promise<void> {
     Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
     Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
   });
-  
+
   console.log("Anonymous context created (for caching without auth)");
 }
+
+// ============ Auto-login ============
 
 let lastBrowserLoginAttempt = 0;
 // Cloudflare challenges the login POST and, when it does not clear, the whole
 // browser session stays challenged afterwards (even /home times out). Retrying
-// on every login redirect therefore makes things worse, so back off hard.
-const BROWSER_LOGIN_COOLDOWN = 30 * 60 * 1000; // 30m
-
-/**
- * Log in to Royal Road with ROYAL_ROAD_USERNAME/PASSWORD inside Firefox and
- * store the resulting session cookie.
- *
- * The HTTP implementation in royalroad-auth.ts cannot do this any more:
- * Cloudflare answers plain fetches from datacenter IPs with a challenge page,
- * so that path never finds the CSRF token and used to report "already logged
- * in" without logging in at all. Driving the real browser gets us a page that
- * actually contains the login form.
- */
-export async function performBrowserLogin(userId: string): Promise<boolean> {
+// on every login redirect therefore makes things worse, so background attempts
+// back off. An explicit user action (Settings > Refresh session) passes
+// `force` and skips the backoff entirely.
+export async function performBrowserLogin(userId: string, opts: { force?: boolean } = {}): Promise<boolean> {
   if (!ENABLE_BROWSER) {
     console.warn("[AutoLogin] Browser login needs ENABLE_BROWSER=true");
     return false;
@@ -415,7 +383,7 @@ export async function performBrowserLogin(userId: string): Promise<boolean> {
     console.error("[AutoLogin] ROYAL_ROAD_USERNAME / ROYAL_ROAD_PASSWORD are not configured");
     return false;
   }
-  if (Date.now() - lastBrowserLoginAttempt < BROWSER_LOGIN_COOLDOWN) {
+  if (!opts.force && Date.now() - lastBrowserLoginAttempt < AUTO_LOGIN_COOLDOWN_MS) {
     console.warn(
       "[AutoLogin] Skipping browser login (attempted recently). " +
       "A fresh session cookie in Settings is the reliable path."
@@ -489,6 +457,7 @@ export async function performBrowserLogin(userId: string): Promise<boolean> {
     setRoyalRoadCookie(userId, identity.name, identity.value);
     const clearance = (await ctx.cookies()).find((c) => c.name === "cf_clearance");
     if (clearance) setRoyalRoadCookie(userId, "cf_clearance", clearance.value);
+    clearSessionState(userId);
 
     // Confirm the session actually works: a valid cookie still gets redirected
     // to the login page when the account was logged out or the cookie rejected.
@@ -511,16 +480,65 @@ export async function performBrowserLogin(userId: string): Promise<boolean> {
   }
 }
 
-async function getPage(
+/**
+ * A page Royal Road answered but that is not the content we asked for: a
+ * Cloudflare interstitial, a redirect still in flight, or a bare error page.
+ *
+ * Caching one of these is far worse than failing — an empty chapter would be
+ * served from cache for days — so the caller throws and the request can simply
+ * be retried.
+ */
+function assertHasContent(label: string, content: string, probe: RegExp): void {
+  if (probe.test(content)) return;
+  const title = (content.match(/<title>([\s\S]*?)<\/title>/i)?.[1] || "")
+    .replace(/\s+/g, ' ')
+    .trim();
+  throw new Error(
+    `Royal Road returned a page without ${label}` +
+    (title ? ` (title: "${title}")` : "") +
+    `. This is usually a transient Cloudflare block — retrying normally works.`
+  );
+}
+
+/** Probes for the anchor element each page type must contain. */
+const CONTENT_PROBE = {
+  chapter: /class="[^"]*\bchapter-content\b/,
+  fiction: /class="[^"]*\bfic-title\b/,
+  list: /class="[^"]*\bfiction-list\b/,
+};
+
+/**
+ * Background chapter pre-caching, serialised so it never runs concurrently
+ * with a live read on the shared browser context.
+ */
+let preCacheChain: Promise<void> = Promise.resolve();
+
+// ============ Page fetching ============
+
+export interface GetPageOptions {
+  /** Set once an auto-login retry has already been attempted. */
+  alreadyRetriedWithLogin?: boolean;
+  /**
+   * True for pages Royal Road serves to logged-out visitors (fiction, chapter,
+   * search, toplists). When the stored session is rejected, these fall back to
+   * an anonymous fetch instead of returning the login page or throwing.
+   * Private pages (follows, read-later, history) leave it false so the caller
+   * gets a real error telling the user to re-authenticate.
+   */
+  allowAnonymous?: boolean;
+}
+
+export async function getPage(
   url: string,
   waitForSelector?: string,
   userId?: string,
-  alreadyRetriedWithLogin?: boolean
+  opts: GetPageOptions = {}
 ): Promise<{ page: Page | null; content: string; release: () => Promise<void> }> {
   const startTime = Date.now();
-  const useAnon = !userId;
-  
-  if (!useAnon && !hasRoyalRoadSession(userId)) {
+  const allowAnonymous = opts.allowAnonymous === true;
+  const hasSession = userId ? hasRoyalRoadSession(userId) : false;
+
+  if (userId && !hasSession && !allowAnonymous) {
     // Prefer the browser login: the HTTP login cannot get past Cloudflare.
     if (ENABLE_BROWSER && ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
       console.log("[Scraper] No session found, attempting auto-login...");
@@ -537,33 +555,55 @@ async function getPage(
     }
   }
 
-  console.log(`[Scraper] Trying HTTP fetch for ${url} (${useAnon ? 'anon' : 'auth'})`);
-  const httpResult = await tryHttpFetch(url, userId);
+  // With a public page and no usable session, go straight to anonymous: there
+  // is nothing an authenticated fetch would add.
+  const wantAuth = !!userId && hasSession && !(allowAnonymous && isSessionKnownDead(userId));
+  console.log(`[Scraper] Trying HTTP fetch for ${url} (${wantAuth ? 'auth' : 'anon'})`);
+
+  const httpResult = await tryHttpFetch(url, wantAuth ? userId : undefined);
   if (httpResult) {
-    console.log(`[Scraper] HTTP fetch succeeded in ${Date.now() - startTime}ms total`);
-    return { page: null, content: httpResult.content, release: async () => {} };
+    if (wantAuth && looksLikeLoginPage(httpResult.content, httpResult.finalUrl)) {
+      // Rejected after an auto-login retry already failed inside tryHttpFetch.
+      if (allowAnonymous) {
+        console.warn(`[Scraper] Session rejected for ${url} - retrying anonymously`);
+      } else {
+        throw new Error(
+          "Royal Road rejected the stored session. " +
+          "Paste a fresh .AspNetCore.Identity.Application cookie in Settings > Royal Road."
+        );
+      }
+    } else {
+      if (wantAuth) clearSessionState(userId);
+      console.log(`[Scraper] HTTP fetch succeeded in ${Date.now() - startTime}ms total`);
+      return { page: null, content: httpResult.content, release: async () => {} };
+    }
   }
 
   if (!ENABLE_BROWSER) {
     throw new Error("HTTP fetch failed and browser fallback is disabled (ENABLE_BROWSER=false). Cloudflare may be blocking requests.");
   }
 
-  console.log(`[Scraper] Falling back to Firefox for ${url}`);
-  
+  console.log(`[Scraper] Falling back to the browser for ${url}`);
+
   await ensureBrowser();
-  
+
   if (!anonContext) {
     throw new Error("Browser contexts not initialized");
   }
-  
+
+  // The anonymous context serves both anonymous requests and the fallback for
+  // a rejected session, so a public page never depends on auth at all.
+  let useAnon = !wantAuth || allowAnonymous;
+  let ctx: BrowserContext | null = useAnon ? anonContext : context;
+
   if (!useAnon && userId) {
     await createContext(userId);
     if (!context) {
       throw new Error("Failed to create authenticated browser context");
     }
+    ctx = context;
   }
 
-  let ctx = useAnon ? anonContext : context;
   if (!ctx) {
     throw new Error("No browser context available");
   }
@@ -571,7 +611,10 @@ async function getPage(
   // This request owns every auth context it creates; close them all when it
   // returns/throws so concurrent requests never close each other's context.
   const requestContexts: BrowserContext[] = [];
-  if (!useAnon && ctx) requestContexts.push(ctx);
+  if (!useAnon && ctx) {
+    inFlightContexts.add(ctx);
+    requestContexts.push(ctx);
+  }
 
   const blockResources = (p: Page) => p.route('**/*', (route) => {
     const resourceType = route.request().resourceType();
@@ -582,34 +625,46 @@ async function getPage(
     }
   });
 
+  const closeOwned = async () => {
+    for (const c of requestContexts) {
+      inFlightContexts.delete(c);
+      try { await c.close(); } catch {}
+    }
+  };
+
   let page = await ctx.newPage();
   await blockResources(page);
 
   try {
     let attempts = 0;
     const maxAttempts = 3;
-    
+
     while (attempts < maxAttempts) {
       attempts++;
-      console.log(`[Scraper] Firefox fetching ${url} (attempt ${attempts})`);
-      
+      console.log(`[Scraper] Browser fetching ${url} (attempt ${attempts})`);
+
       const navStart = Date.now();
-      await page.goto(url, { 
+      await page.goto(url, {
         waitUntil: "domcontentloaded",
-        timeout: SCRAPER_TIMEOUT 
+        timeout: SCRAPER_TIMEOUT
       });
-      console.log(`[Scraper] Firefox navigation completed in ${Date.now() - navStart}ms`);
+      console.log(`[Scraper] Navigation completed in ${Date.now() - navStart}ms`);
 
       const pageContent = await page.content();
-      if (pageContent.includes("challenge-running") || pageContent.includes("cf-browser-verification") || pageContent.includes("cf-turnstile")) {
+      if (
+        pageContent.includes("challenge-running") ||
+        pageContent.includes("cf-browser-verification") ||
+        pageContent.includes("cf-turnstile")
+      ) {
         console.log("[Scraper] Cloudflare challenge detected, waiting 5s...");
         await page.waitForTimeout(5000);
         continue;
       }
-      
-      if (page.url().includes("/account/login") || pageContent.includes('action="/account/login"')) {
+
+      if (looksLikeLoginPage(pageContent, page.url())) {
         console.warn("[Scraper] WARNING: Redirected to login page - cookies may be invalid or expired!");
-        if (userId && !alreadyRetriedWithLogin && ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
+        if (userId && !opts.alreadyRetriedWithLogin && ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
+          markSessionDead(userId);
           await page.close();
           console.log("[Scraper] Attempting auto-login before retry...");
           const loggedIn = ENABLE_BROWSER
@@ -617,9 +672,18 @@ async function getPage(
             : await performAutoLogin(userId);
           // Always rebuild the page: it was just closed above, so retrying on
           // it fails with "Target page, context or browser has been closed".
-          // When the login failed there is nothing new to try, so give up
-          // rather than burn the remaining attempts on a dead session.
           if (!loggedIn) {
+            if (allowAnonymous) {
+              // A public page still renders for a logged-out visitor, which is
+              // far better than an error page - just without personal state.
+              console.warn(`[Scraper] Could not restore the session; serving ${url} anonymously`);
+              useAnon = true;
+              ctx = anonContext;
+              await closeOwned();
+              page = await ctx.newPage();
+              await blockResources(page);
+              continue;
+            }
             throw new Error(
               "Royal Road rejected the stored session and auto-login could not restore it. " +
               "Paste a fresh .AspNetCore.Identity.Application cookie in Settings > Royal Road."
@@ -627,11 +691,29 @@ async function getPage(
           }
           await createContext(userId);
           ctx = context!;
+          await closeOwned();
+          inFlightContexts.add(ctx);
           requestContexts.push(ctx);
           page = await ctx.newPage();
           await blockResources(page);
           continue;
         }
+
+        if (allowAnonymous) {
+          console.warn(`[Scraper] Login redirect on a public page - serving ${url} anonymously`);
+          useAnon = true;
+          ctx = anonContext;
+          await closeOwned();
+          page = await ctx.newPage();
+          await blockResources(page);
+          continue;
+        }
+
+        if (userId) markSessionDead(userId);
+        throw new Error(
+          "Royal Road rejected the stored session. " +
+          "Paste a fresh .AspNetCore.Identity.Application cookie in Settings > Royal Road."
+        );
       }
 
       if (waitForSelector) {
@@ -645,13 +727,11 @@ async function getPage(
       }
 
       const content = await page.content();
-      console.log(`[Scraper] Firefox page fetched in ${Date.now() - startTime}ms total`);
-      await rememberCookiesFromBrowser(ctx, userId);
+      console.log(`[Scraper] Browser page fetched in ${Date.now() - startTime}ms total`);
+      await rememberCookiesFromBrowser(ctx, wantAuth ? userId : undefined);
       const release = async () => {
         try { await page.close(); } catch {}
-        for (const c of requestContexts) {
-          try { await c.close(); } catch {}
-        }
+        await closeOwned();
       };
       return { page, content, release };
     }
@@ -659,35 +739,40 @@ async function getPage(
     throw new Error("Failed to bypass Cloudflare after multiple attempts");
   } catch (error) {
     try { await page.close(); } catch {}
-    for (const c of requestContexts) {
-      try { await c.close(); } catch {}
-    }
+    await closeOwned();
     throw error;
   }
 }
 
 /**
- * Resolve a redirect URL to get the final URL (used for /chapter/next/ URLs)
- * Uses a lightweight HEAD request instead of opening a browser page
- * Returns the final URL after redirects, or null if failed
+ * Resolve a redirect URL to get the final URL (used for /chapter/next/ URLs).
+ *
+ * Uses `redirect: "manual"` and reads the Location header rather than following
+ * the redirect, because `response.url` silently returns the *requested* URL when
+ * the server refuses the request (Cloudflare answering 403, or a 405 for HEAD).
+ * That used to make `/chapter/next/192682` resolve to chapter id 192682 - the
+ * fiction id - which pointed the Follows "read next" button at a chapter that
+ * does not exist.
  */
 async function resolveRedirectUrl(url: string, userId?: string): Promise<string | null> {
   try {
-    const headers: Record<string, string> = {
-      "User-Agent": USER_AGENT,
-    };
-    
-    if (userId) {
-      headers["Cookie"] = getCookiesForFetch(userId);
+    const headers: Record<string, string> = { "User-Agent": USER_AGENT };
+    const cookieHeader = getCookiesForFetch(userId);
+    if (cookieHeader) headers["Cookie"] = cookieHeader;
+
+    const response = await fetch(url, { method: "GET", redirect: "manual", headers });
+
+    const location = response.headers.get("location");
+    if (location) {
+      return new URL(location, url).toString();
     }
-    
-    const response = await fetch(url, {
-      method: "HEAD",
-      redirect: "follow",
-      headers,
-    });
-    
-    return response.url;
+
+    // Some servers answer the redirect without a Location; fall back to the
+    // final URL, but only trust it when it actually moved.
+    if (response.url && response.url !== url && response.url !== `${url}/`) {
+      return response.url;
+    }
+    return null;
   } catch (error) {
     console.error(`Failed to resolve redirect for ${url}:`, error);
     return null;
@@ -696,7 +781,7 @@ async function resolveRedirectUrl(url: string, userId?: string): Promise<string 
 
 export async function closeBrowser(): Promise<void> {
   if (!ENABLE_BROWSER) return;
-  
+
   if (anonContext) {
     await anonContext.close();
     anonContext = null;
@@ -717,125 +802,26 @@ if (ENABLE_BROWSER) {
   });
 }
 
-// ============ Parsing Helpers ============
-
-/**
- * Parse fiction list from HTML (works for toplists)
- */
-function parseFictionList(html: string): Fiction[] {
-  const { document } = parseHTML(html);
-  const fictions: Fiction[] = [];
-
-  const items = document.querySelectorAll(".fiction-list-item");
-  
-  for (const item of items) {
-    try {
-      const titleEl = item.querySelector("h2.fiction-title a, .fiction-title a");
-      if (!titleEl) continue;
-
-      const href = titleEl.getAttribute("href") || "";
-      const idMatch = href.match(/\/fiction\/(\d+)/);
-      if (!idMatch) continue;
-
-      const id = parseInt(idMatch[1], 10);
-      const title = titleEl.textContent?.trim() || "";
-      
-      // Tags (first 3 genre tags)
-      const tagEls = item.querySelectorAll(".fiction-tag");
-      const tags: string[] = [];
-      for (let i = 0; i < Math.min(tagEls.length, 3); i++) {
-        const tagText = tagEls[i].textContent?.trim();
-        if (tagText) tags.push(tagText);
-      }
-
-      // Rating from star span's title attribute (e.g., title="4.75")
-      const starEl = item.querySelector(".star[title]");
-      const rating = starEl ? parseFloat(starEl.getAttribute("title") || "0") : undefined;
-
-      // Stats from the stats row - parse by icon class
-      let followers: number | undefined;
-      let pages: number | undefined;
-      
-      const statsRow = item.querySelector(".row.stats");
-      if (statsRow) {
-        const statDivs = statsRow.querySelectorAll(".col-sm-6");
-        for (const div of statDivs) {
-          const text = div.textContent?.trim() || "";
-          const icon = div.querySelector("i");
-          const iconClass = icon?.getAttribute("class") || "";
-          
-          // Parse number from text (e.g., "2,857 Followers" -> 2857)
-          const numMatch = text.match(/([\d,]+)/);
-          const num = numMatch ? parseInt(numMatch[1].replace(/,/g, ""), 10) : undefined;
-          
-          if (iconClass.includes("fa-users") && num !== undefined) {
-            followers = num;
-          } else if (iconClass.includes("fa-book") && num !== undefined) {
-            pages = num;
-          }
-        }
-      }
-
-      // Description (hidden by default in toplist HTML)
-      const descEl = item.querySelector(".hidden-content, .fiction-description, .margin-top-10.col-xs-12, [id^='description-']");
-      const description = descEl?.textContent?.trim() || "";
-
-      // Cover
-      const coverEl = item.querySelector("img[src*='covers'], img.thumbnail, img[data-type='cover']");
-      let coverUrl = coverEl?.getAttribute("src") || undefined;
-      if (coverUrl && !coverUrl.startsWith("http")) {
-        coverUrl = `https://www.royalroad.com${coverUrl}`;
-      }
-
-      fictions.push({
-        id,
-        title,
-        author: "", // Not available in toplist HTML
-        url: `${ROYAL_ROAD_BASE_URL}${href}`,
-        coverUrl,
-        description,
-        tags,
-        stats: {
-          rating,
-          followers,
-          pages,
-        },
-      });
-    } catch (e) {
-      console.error("Error parsing fiction item:", e);
-    }
-  }
-
-  return fictions;
-}
-
 // ============ Scraper Functions ============
 
-/**
- * The label text of a follows row, i.e. everything in the <li> that is not the
- * chapter link: "Last Update:", "Last read:", "Last Update & Last Read:".
- * Dropping the link keeps a chapter title that happens to contain the label
- * words from being read as the label itself.
- */
-function readRowLabel(li: Element): string {
-  const clone = li.cloneNode(true) as Element;
-  for (const link of Array.from(clone.querySelectorAll("a"))) {
-    link.remove();
-  }
-  return clone.textContent || "";
-}
-
-/**
- * How long ago a row's chapter was touched, as Royal Road words it
- * ("32 minutes ago"). It renders this as a <time> element followed by a plain
- * " ago" text node, so read the whole wrapper rather than the <time> alone —
- * that way the trailing unit survives even if the split moves.
- */
-function readRowAgo(li: Element): string | undefined {
-  const holder = li.querySelector("time")?.parentElement;
-  if (!holder) return undefined;
-  const text = (holder.textContent || "").replace(/\s+/g, " ").trim();
-  return text || undefined;
+/** Map a parsed card onto the shared FollowedFiction shape. */
+function toFollowedFiction(card: ParsedCard): FollowedFictionWithRecency {
+  return {
+    id: card.id,
+    title: card.title,
+    author: card.author,
+    url: card.href,
+    coverUrl: card.coverUrl,
+    hasUnread: card.hasUnread,
+    latestChapter: card.latestChapter,
+    latestChapterId: card.latestChapterId,
+    lastRead: card.lastRead,
+    lastReadChapterId: card.lastReadChapterId,
+    nextChapterId: card.nextChapterId,
+    nextChapterTitle: card.nextChapterTitle,
+    lastUpdateAgo: card.lastUpdateAgo,
+    lastReadAgo: card.lastReadAgo,
+  };
 }
 
 export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS): Promise<FollowedFiction[]> {
@@ -846,170 +832,57 @@ export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS
     return JSON.parse(cached);
   }
 
-  const { page, content, release } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, "[data-rr-expanded-fic-card]", userId);
+  const { content, release } = await getPage(
+    `${ROYAL_ROAD_BASE_URL}/my/follows`,
+    FICTION_CARD_WAIT_SELECTOR,
+    userId,
+  );
   await release();
 
-  const { document } = parseHTML(content);
-  const fictions: FollowedFiction[] = [];
+  const cards = parseCards(content);
+  console.log(`Found ${cards.length} fiction cards`);
 
-  // Royal Road redesigned /my/follows (Oct 2026): each entry is a
-  // [data-rr-expanded-fic-card] card instead of an old .fiction-list-item row.
-  const rows = document.querySelectorAll("[data-rr-expanded-fic-card]");
-  console.log(`Found ${rows.length} fiction items`);
-  
-  for (const row of rows) {
-    try {
-      const titleEl = row.querySelector("h2 a[href^='/fiction/']");
-      if (!titleEl) continue;
-
-      const href = titleEl.getAttribute("href") || "";
-      const idMatch = href.match(/\/fiction\/(\d+)/);
-      if (!idMatch) continue;
-
-      const id = parseInt(idMatch[1], 10);
-      const title = titleEl.textContent?.trim() || "";
-      
-      // Author
-      let author = "";
-      const authorEl = row.querySelector("span.author a[href*='/profile/']");
-      if (authorEl) {
-        author = authorEl.textContent?.trim() || "";
-      } else {
-        const profileLink = row.querySelector("a[href*='/profile/']");
-        if (profileLink) {
-          author = profileLink.textContent?.trim() || "";
-        }
-      }
-      
-      // Unread indicator (new design: red dot badge in the title row)
-      const hasUnread = !!row.querySelector("i.fa-circle") || row.innerHTML.includes("bg-danger");
-
-      // Cover
-      const coverEl = row.querySelector("img[data-type='cover'], img[src*='covers'], img.thumbnail");
-      let coverUrl = coverEl?.getAttribute("src") || undefined;
-      if (coverUrl && !coverUrl.startsWith("http")) {
-        coverUrl = `https://www.royalroad.com${coverUrl}`;
-      }
-      
-      // Chapter info (new design: plain <li> rows inside the card's <ul>)
-      const listItems = row.querySelectorAll("ul li");
-      let latestChapter = "";
-      let latestChapterId: number | undefined;
-      let lastReadChapter = "";
-      let lastReadChapterId: number | undefined;
-      let nextChapterId: number | undefined;
-      let nextChapterTitle: string | undefined;
-      let lastUpdateAgo: string | undefined;
-      let lastReadAgo: string | undefined;
-      
-      for (const li of listItems) {
-        const chapterLink = li.querySelector("a[href*='/chapter/']");
-        const chapterNameEl = li.querySelector("a span.col-xs-8") || li.querySelector("a span.flex-1");
-        const chapterName = chapterNameEl?.textContent?.trim() || "";
-        const chapterHref = chapterLink?.getAttribute("href") || "";
-        const chapterIdMatch = chapterHref.match(/\/chapter\/(\d+)/);
-        const chapterId = chapterIdMatch ? parseInt(chapterIdMatch[1], 10) : undefined;
-
-        // Match on the label alone, never on the whole row: the chapter title
-        // is part of the row text, so a chapter called "Last Read It All"
-        // would otherwise be mistaken for the label. Royal Road has shipped
-        // these as "Last Update:", "Last Read Chapter:" and now "Last read:",
-        // and folds both into a single "Last Update & Last Read:" row when a
-        // fiction has one chapter — so match the words, unanchored, on the
-        // label only, and let one row fill in both.
-        const label = readRowLabel(li);
-        // Royal Road writes the recency as "32 minutes " + "ago" split across
-        // the <time> and a trailing text node, so take the <time> text and add
-        // the unit back rather than scraping the rendered string.
-        const ago = readRowAgo(li);
-        if (/last\s+update/i.test(label)) {
-          latestChapter = chapterName;
-          latestChapterId = chapterId;
-          lastUpdateAgo = ago;
-        }
-        if (/last\s+read/i.test(label)) {
-          lastReadChapter = chapterName;
-          lastReadChapterId = chapterId;
-          lastReadAgo = ago;
-        }
-      }
-      
-      // Read button (next unread chapter)
-      // Royal Road uses /chapter/next/{fictionId} which redirects to actual chapter
-      let nextChapterUrl: string | undefined;
-      const readButton = row.querySelector("a.btn[href*='/chapter/']") || row.querySelector("a[href*='/chapter/next/']");
-      if (readButton) {
-        const readHref = readButton.getAttribute("href") || "";
-        // Try direct chapter ID first (e.g., /chapter/123456)
-        const directMatch = readHref.match(/\/chapter\/(\d+)$/);
-        if (directMatch) {
-          nextChapterId = parseInt(directMatch[1], 10);
-          {
-            const t = readButton.textContent?.trim();
-            nextChapterTitle = t && !/^(read|continue|open|next)/i.test(t.replace(/\s+/g, " ")) ? t : (t && /chapter/i.test(t) && !/^open/i.test(t) ? t : undefined);
-          }
-        } else if (readHref.includes("/chapter/next/")) {
-          // Store the redirect URL to resolve later
-          nextChapterUrl = readHref.startsWith("http") ? readHref : `${ROYAL_ROAD_BASE_URL}${readHref}`;
-          {
-            const t = readButton.textContent?.trim();
-            nextChapterTitle = t && !/^(read|continue|open|next)/i.test(t.replace(/\s+/g, " ")) ? t : (t && /chapter/i.test(t) && !/^open/i.test(t) ? t : undefined);
-          }
-        }
-      }
-
-      fictions.push({
-        id,
-        title,
-        author,
-        url: `${ROYAL_ROAD_BASE_URL}${href}`,
-        coverUrl,
-        hasUnread,
-        latestChapter,
-        latestChapterId,
-        lastRead: lastReadChapter,
-        lastReadChapterId,
-        nextChapterId,
-        nextChapterTitle,
-        lastUpdateAgo,
-        lastReadAgo,
-        _nextChapterUrl: nextChapterUrl, // Temporary field for redirect resolution
-      } as FollowedFiction & { _nextChapterUrl?: string });
-    } catch (e) {
-      console.error("Error parsing follow item:", e);
-    }
-  }
+  // Carry the unresolved redirect target alongside each row so the parallel
+  // resolver below can find it without a second parse.
+  const fictions = cards.map((card) => ({
+    ...toFollowedFiction(card),
+    ...(card.nextChapterResolveUrl ? { __resolveUrl: card.nextChapterResolveUrl } : {}),
+  })) as (FollowedFiction & { __resolveUrl?: string })[];
 
   // Resolve /chapter/next/ redirect URLs to get actual chapter IDs
-  // Use parallel requests with concurrency limit to avoid overwhelming the server
-  const fictionsNeedingResolution = fictions.filter(
-    (f) => (f as FollowedFiction & { _nextChapterUrl?: string })._nextChapterUrl && !f.nextChapterId
-  );
-  
-  if (fictionsNeedingResolution.length > 0) {
+  const needing = fictions.filter((f) => !!f.__resolveUrl && !f.nextChapterId);
+
+  if (needing.length > 0) {
     const startTime = Date.now();
-    console.log(`Resolving ${fictionsNeedingResolution.length} next chapter redirect URLs (parallel, max 10)...`);
-    
-    await parallelLimit(fictionsNeedingResolution, 10, async (fiction) => {
-      const f = fiction as FollowedFiction & { _nextChapterUrl?: string };
-      if (!f._nextChapterUrl) return;
-      
+    console.log(`Resolving ${needing.length} next chapter redirect URLs (parallel, max 10)...`);
+
+    await parallelLimit(needing, 10, async (fiction) => {
+      const resolve = fiction.__resolveUrl;
+      if (!resolve) return;
+
       try {
-        const finalUrl = await resolveRedirectUrl(f._nextChapterUrl, userId);
-        if (finalUrl) {
-          const chapterIdMatch = finalUrl.match(/\/chapter\/(\d+)/);
-          if (chapterIdMatch) {
-            f.nextChapterId = parseInt(chapterIdMatch[1], 10);
-          }
+        const finalUrl = await resolveRedirectUrl(resolve, userId);
+        const chapterId = finalUrl ? finalUrl.match(/\/chapter\/(\d+)/)?.[1] : undefined;
+
+        // The redirect target must be a chapter *other than* the fiction id
+        // that was in the /chapter/next/<id> path. Anything else means the
+        // redirect never resolved (challenge, 405, ...) and the id we read is
+        // the fiction's own, which would link to a chapter that does not exist.
+        const requestedFictionId = resolve.match(/\/chapter\/next\/(\d+)/)?.[1];
+        if (chapterId && chapterId !== requestedFictionId) {
+          fiction.nextChapterId = parseInt(chapterId, 10);
+        } else if (chapterId) {
+          console.warn(
+            `[Scraper] Next-chapter redirect for "${fiction.title}" did not resolve ` +
+            `(got ${chapterId}, same as the fiction id) - leaving the read link unset`
+          );
         }
       } catch (e) {
-        console.error(`Failed to resolve next chapter URL for "${f.title}":`, e);
+        console.error(`Failed to resolve next chapter URL for "${fiction.title}":`, e);
       }
-      
-      delete f._nextChapterUrl;
     });
-    
-    console.log(`Resolved ${fictionsNeedingResolution.length} redirect URLs in ${Date.now() - startTime}ms`);
+
+    console.log(`Resolved ${needing.length} redirect URLs in ${Date.now() - startTime}ms`);
   }
 
   if (fictions.length > 0) {
@@ -1020,55 +893,15 @@ export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS
 }
 
 export async function getHistory(userId: string): Promise<HistoryEntry[]> {
-  const { page, content, release } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/history`, ".fiction-list", userId);
+  const { content, release } = await getPage(
+    `${ROYAL_ROAD_BASE_URL}/my/history`,
+    HISTORY_ROW_SELECTOR,
+    userId,
+  );
   await release();
 
-  const { document } = parseHTML(content);
-  const history: HistoryEntry[] = [];
-
-  const rows = document.querySelectorAll(".fiction-list > .row");
-  console.log(`Found ${rows.length} history items`);
-  
-  for (const row of rows) {
-    try {
-      const links = row.querySelectorAll("a[href*='/fiction/']");
-      if (links.length < 2) continue;
-      
-      const fictionLink = row.querySelector("a[href*='/fiction/']:not([href*='/chapter/'])");
-      if (!fictionLink) continue;
-
-      const fictionHref = fictionLink.getAttribute("href") || "";
-      const fictionIdMatch = fictionHref.match(/\/fiction\/(\d+)/);
-      if (!fictionIdMatch) continue;
-
-      const fictionId = parseInt(fictionIdMatch[1], 10);
-      const fictionTitle = fictionLink.textContent?.trim() || "";
-
-      const chapterLink = row.querySelector("a[href*='/chapter/']");
-      if (!chapterLink) continue;
-
-      const chapterHref = chapterLink.getAttribute("href") || "";
-      const chapterIdMatch = chapterHref.match(/\/chapter\/(\d+)/);
-      if (!chapterIdMatch) continue;
-
-      const chapterId = parseInt(chapterIdMatch[1], 10);
-      const chapterTitle = chapterLink.textContent?.trim() || "";
-
-      const timeEl = row.querySelector("time");
-      const readAt = timeEl?.textContent?.trim() || "";
-
-      history.push({
-        fictionId,
-        fictionTitle,
-        chapterId,
-        chapterTitle,
-        readAt,
-      });
-    } catch (e) {
-      console.error("Error parsing history item:", e);
-    }
-  }
-
+  const history = parseHistoryPage(content);
+  console.log(`Found ${history.length} history items`);
   console.log(`Parsed ${history.length} history entries`);
   return history;
 }
@@ -1081,69 +914,25 @@ export async function getReadLater(userId: string, ttl: number = CACHE_TTL.FOLLO
     return JSON.parse(cached);
   }
 
-  const { page, content, release } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/readlater`, "[data-rr-expanded-fic-card]", userId);
+  const { content, release } = await getPage(
+    `${ROYAL_ROAD_BASE_URL}/my/readlater`,
+    FICTION_CARD_WAIT_SELECTOR,
+    userId,
+  );
   await release();
 
-  const { document } = parseHTML(content);
-  const fictions: Fiction[] = [];
+  const cards = parseCards(content);
+  console.log(`Found ${cards.length} read later items`);
 
-  // Same redesigned card markup as /my/follows.
-  const rows = document.querySelectorAll("[data-rr-expanded-fic-card]");
-  console.log(`Found ${rows.length} read later items`);
-
-  for (const row of rows) {
-    try {
-      // New design: the fiction anchor wraps the <h2> (a[data-vt-trigger] > h2).
-      // Old-style follows markup has h2 > a instead, so try both.
-      const titleEl = row.querySelector("h2 a[href^='/fiction/']") || row.querySelector("a[data-vt-trigger] h2") || row.querySelector("h2");
-      if (!titleEl) continue;
-
-      const titleAnchor = titleEl.closest("a[href^='/fiction/']") || titleEl.querySelector("a[href^='/fiction/']") || titleEl.parentElement?.closest("a");
-      const href = (titleAnchor?.getAttribute("href") || titleEl.getAttribute("href") || "").split("?")[0];
-      const idMatch = href.match(/\/fiction\/(\d+)/);
-      if (!idMatch) continue;
-
-      const id = parseInt(idMatch[1], 10);
-      const title = titleEl.textContent?.trim() || "";
-
-      let author = "";
-      const authorEl = row.querySelector("span.author a[href*='/profile/']") || row.querySelector("a[href*='/profile/']");
-      if (authorEl) {
-        author = authorEl.textContent?.trim() || "";
-      }
-
-      const coverEl = row.querySelector("img[data-type='cover'], img[src*='covers'], img.thumbnail");
-      let coverUrl = coverEl?.getAttribute("src") || undefined;
-      if (coverUrl && !coverUrl.startsWith("http")) {
-        coverUrl = `https://www.royalroad.com${coverUrl}`;
-      }
-
-      let pages: number | undefined;
-      const pageCountEl = row.querySelector("span.page-count");
-      if (pageCountEl) {
-        const text = pageCountEl.textContent?.trim() || "";
-        const numMatch = text.match(/([\d,]+)/);
-        if (numMatch) {
-          pages = parseInt(numMatch[1].replace(/,/g, ""), 10);
-        }
-      }
-
-      const descEl = row.querySelector(".hidden-content");
-      const description = descEl?.textContent?.trim() || "";
-
-      fictions.push({
-        id,
-        title,
-        author,
-        url: `${ROYAL_ROAD_BASE_URL}${href}`,
-        coverUrl,
-        description,
-        stats: { pages },
-      });
-    } catch (e) {
-      console.error("Error parsing read later item:", e);
-    }
-  }
+  const fictions: Fiction[] = cards.map((card) => ({
+    id: card.id,
+    title: card.title,
+    author: card.author,
+    url: card.href,
+    coverUrl: card.coverUrl,
+    description: card.description,
+    stats: card.pageCount ? { pages: card.pageCount } : undefined,
+  }));
 
   if (fictions.length > 0) {
     setCache(cacheKey, JSON.stringify(fictions), ttl);
@@ -1160,11 +949,12 @@ export async function getToplist(toplist: ToplistType, userId?: string, ttl: num
     return JSON.parse(cached);
   }
 
-  const { page, content, release } = await getPage(toplist.url, ".fiction-list", userId);
+  const { content, release } = await getPage(toplist.url, ".fiction-list", userId);
   await release();
 
+  assertHasContent("the fiction list", content, CONTENT_PROBE.list);
   const fictions = parseFictionList(content);
-  
+
   if (fictions.length > 0) {
     setCache(cacheKey, JSON.stringify(fictions), ttl);
   }
@@ -1182,7 +972,7 @@ export function getToplistCached(toplist: ToplistType): Fiction[] | null {
 }
 
 export async function getFiction(id: number, userId?: string, ttl: number = CACHE_TTL.FICTION): Promise<Fiction | null> {
-  const cacheKey = `fiction:${id}`;
+  const cacheKey = fictionCacheKey(id, userId);
   const cached = getCache(cacheKey);
   if (cached) {
     console.log(`Returning cached fiction: ${id}`);
@@ -1190,247 +980,19 @@ export async function getFiction(id: number, userId?: string, ttl: number = CACH
   }
 
   const url = `${ROYAL_ROAD_BASE_URL}/fiction/${id}`;
-  const { page, content, release } = await getPage(url, ".fic-title", userId);
-  
-  // Try to get chapters from window.chapters variable (only works with browser)
-  let chapters: Chapter[] = [];
-  if (page) {
-    try {
-      const chaptersData = await page.evaluate(() => {
-        return (window as any).chapters || [];
-      });
-      
-      chapters = chaptersData.map((c: any) => ({
-        id: c.id,
-        title: c.title,
-        url: `/chapter/${c.id}`,
-        date: c.date,
-        order: c.order,
-      }));
-    } catch (e) {
-      console.log("Could not get chapters from JS, parsing HTML");
-    }
-    await release();
-  }
+  const { content, release } = await getPage(url, ".fic-title", userId, { allowAnonymous: true });
+  await release();
 
-  const { document } = parseHTML(content);
+  assertHasContent("the fiction header", content, CONTENT_PROBE.fiction);
 
-  // Title
-  const titleEl = document.querySelector(".fic-title h1, h1.font-white");
-  
-  // Author
-  let author = "Unknown";
-  const authorEl = document.querySelector(".fic-title a[href*='/profile/']");
-  if (authorEl) {
-    author = authorEl.textContent?.trim() || "Unknown";
-  } else {
-    const headerProfileLink = document.querySelector(".fic-header a[href*='/profile/']");
-    if (headerProfileLink) {
-      author = headerProfileLink.textContent?.trim() || "Unknown";
-    }
-  }
-  
-  // Description
-  const descEl = document.querySelector(".description, .fiction-description");
-  
-  // Cover
-  const coverEl = document.querySelector(".fic-header img[src*='covers'], .cover-art-container img, img.cover-art, .thumbnail img");
-  let coverUrl = coverEl?.getAttribute("src") || undefined;
-  if (coverUrl && !coverUrl.startsWith("http")) {
-    coverUrl = `https://www.royalroad.com${coverUrl}`;
-  }
-  
-  // Stats
-  const statsContainer = document.querySelector(".fiction-stats");
-  let rating: number | undefined;
-  let styleScore: number | undefined;
-  let storyScore: number | undefined;
-  let grammarScore: number | undefined;
-  let characterScore: number | undefined;
-  let views: number | undefined;
-  let averageViews: number | undefined;
-  let followers: number | undefined;
-  let favorites: number | undefined;
-  let ratings: number | undefined;
-  let pages: number | undefined;
+  // Chapters come from the window.chapters script array, which the parser
+  // reads out of the HTML. There is deliberately no page.evaluate() here: it
+  // needs the browser page alive, and the HTTP fast path has none, so the two
+  // paths used to disagree on the chapter list.
+  const parsed = parseFictionPage(content, id, url);
 
-  if (statsContainer) {
-    // Parse star ratings from data-content attribute (e.g., "4.66 / 5")
-    const parseRating = (el: Element | null): number | undefined => {
-      if (!el) return undefined;
-      const content = el.getAttribute("data-content") || el.getAttribute("aria-label") || "";
-      const match = content.match(/([\d.]+)/);
-      return match ? parseFloat(match[1]) : undefined;
-    };
-
-    // Find ratings by their labels
-    const listItems = statsContainer.querySelectorAll("li.list-item, li");
-    let currentLabel = "";
-    
-    for (const li of listItems) {
-      const text = li.textContent?.trim() || "";
-      const starEl = li.querySelector(".star, [data-content]");
-      
-      if (text.includes("Overall Score")) {
-        currentLabel = "overall";
-      } else if (text.includes("Style Score")) {
-        currentLabel = "style";
-      } else if (text.includes("Story Score")) {
-        currentLabel = "story";
-      } else if (text.includes("Grammar Score")) {
-        currentLabel = "grammar";
-      } else if (text.includes("Character Score")) {
-        currentLabel = "character";
-      } else if (starEl) {
-        const score = parseRating(starEl);
-        if (currentLabel === "overall") rating = score;
-        else if (currentLabel === "style") styleScore = score;
-        else if (currentLabel === "story") storyScore = score;
-        else if (currentLabel === "grammar") grammarScore = score;
-        else if (currentLabel === "character") characterScore = score;
-        currentLabel = "";
-      }
-    }
-
-    // Parse numeric stats from the right column
-    const statsListItems = statsContainer.querySelectorAll(".col-sm-6:last-child li, .stats-content li");
-    let nextStatType = "";
-    
-    for (const li of statsListItems) {
-      const text = li.textContent?.trim().toUpperCase() || "";
-      
-      if (text.includes("TOTAL VIEWS")) {
-        nextStatType = "views";
-      } else if (text.includes("AVERAGE VIEWS")) {
-        nextStatType = "avgViews";
-      } else if (text.includes("FOLLOWERS")) {
-        nextStatType = "followers";
-      } else if (text.includes("FAVORITES")) {
-        nextStatType = "favorites";
-      } else if (text.includes("RATINGS")) {
-        nextStatType = "ratings";
-      } else if (text.includes("PAGES")) {
-        nextStatType = "pages";
-      } else if (nextStatType && li.classList.contains("font-red-sunglo")) {
-        const num = parseInt(text.replace(/,/g, ""), 10);
-        if (!isNaN(num)) {
-          if (nextStatType === "views") views = num;
-          else if (nextStatType === "avgViews") averageViews = num;
-          else if (nextStatType === "followers") followers = num;
-          else if (nextStatType === "favorites") favorites = num;
-          else if (nextStatType === "ratings") ratings = num;
-          else if (nextStatType === "pages") pages = num;
-        }
-        nextStatType = "";
-      }
-    }
-  } else {
-    // Fallback: try to get at least the overall rating
-    const ratingEl = document.querySelector(".star[data-content], [data-original-title*='Score']");
-    rating = ratingEl ? parseFloat(ratingEl.getAttribute("data-content") || "0") : undefined;
-  }
-
-  // Parse chapters from HTML if not from JS
-  let lastReadChapterIdx = -1;
-  
-  if (chapters.length === 0) {
-    const chapterRows = document.querySelectorAll("tr[data-url], .chapter-row");
-    let idx = 0;
-    
-    for (const row of chapterRows) {
-      const href = row.getAttribute("data-url") || row.querySelector("a")?.getAttribute("href") || "";
-      const chapterMatch = href.match(/\/chapter\/(\d+)/);
-      if (!chapterMatch) continue;
-
-      const chapterTitle = row.querySelector("a")?.textContent?.trim() || "";
-      const dateEl = row.querySelector("time, .chapter-date");
-      
-      // Check for reading progress indicator (marks last read chapter)
-      const hasReadingProgress = !!row.querySelector("i.fa-caret-right[data-original-title*='Reading Progress']");
-      if (hasReadingProgress) {
-        lastReadChapterIdx = idx;
-      }
-      
-      chapters.push({
-        id: parseInt(chapterMatch[1], 10),
-        title: chapterTitle,
-        url: `/chapter/${chapterMatch[1]}`,
-        date: dateEl?.textContent?.trim(),
-      });
-      idx++;
-    }
-  }
-
-  // Continue Reading link
-  const continueLink = document.querySelector("a.btn[href*='/chapter/'][class*='continue'], a.btn-primary[href*='/chapter/']");
-  let continueChapterId: number | undefined;
-  if (continueLink) {
-    const continueHref = continueLink.getAttribute("href") || "";
-    const continueMatch = continueHref.match(/\/chapter\/(\d+)/);
-    if (continueMatch) {
-      continueChapterId = parseInt(continueMatch[1], 10);
-    }
-  }
-
-  // Mark chapters as read based on reading progress indicator
-  if (lastReadChapterIdx >= 0) {
-    // Reading progress icon found - mark all chapters up to and including it as read
-    for (let i = 0; i <= lastReadChapterIdx; i++) {
-      chapters[i].isRead = true;
-    }
-  } else if (continueChapterId) {
-    // Fallback: use continueChapterId as boundary
-    // Chapters before continueChapterId are considered read
-    const continueIdx = chapters.findIndex(c => c.id === continueChapterId);
-    if (continueIdx > 0) {
-      for (let i = 0; i < continueIdx; i++) {
-        chapters[i].isRead = true;
-      }
-    }
-  }
-
-  // Parse bookmark state (Follow, Favorite, Read Later buttons)
-  const followButton = document.querySelector("#follow-button");
-  const favoriteButton = document.querySelector("#favorite-button");
-  const rilButton = document.querySelector("#ril-button");
-  const isFollowing = followButton?.classList?.contains("active") || false;
-  const isFavorite = favoriteButton?.classList?.contains("active") || false;
-  const isReadLater = rilButton?.classList?.contains("active") || false;
-  
-  // Get CSRF token (needed for bookmark actions)
-  const csrfInput = document.querySelector('input[name="__RequestVerificationToken"]');
-  const csrfToken = csrfInput?.getAttribute("value") || undefined;
-
-  const fiction: Fiction = {
-    id,
-    title: titleEl?.textContent?.trim() || `Fiction ${id}`,
-    author,
-    url,
-    coverUrl,
-    description: descEl?.textContent?.trim(),
-    stats: {
-      rating,
-      styleScore,
-      storyScore,
-      grammarScore,
-      characterScore,
-      views,
-      averageViews,
-      followers,
-      favorites,
-      ratings,
-      pages,
-    },
-    chapters,
-    continueChapterId,
-    isFollowing,
-    isFavorite,
-    isReadLater,
-    csrfToken,
-  };
-
-  setCache(cacheKey, JSON.stringify(fiction), ttl);
-  return fiction;
+  setCache(cacheKey, JSON.stringify(parsed.fiction), ttl);
+  return parsed.fiction;
 }
 
 export async function getChapter(
@@ -1444,7 +1006,7 @@ export async function getChapter(
 
   // Cache-first on every path. The reader's live GETs used to skip the cache
   // entirely (only pre-caching consulted it), so every chapter read re-scraped
-  // Royal Road from scratch and never reused the 30-day row. Only the
+  // Royal Road from scratch and never reused the cached row. Only the
   // mark-as-read path (forceLive) must hit upstream — that's how RR records
   // read state.
   if (!opts?.forceLive) {
@@ -1454,201 +1016,32 @@ export async function getChapter(
       return JSON.parse(cached);
     }
   }
-  
+
   const { page, content, release } = await getPage(
-    `${ROYAL_ROAD_BASE_URL}/fiction/0/chapter/${chapterId}`, 
+    `${ROYAL_ROAD_BASE_URL}/fiction/0/chapter/${chapterId}`,
     ".chapter-content",
-    isPreCaching ? undefined : userId
+    userId,
+    { allowAnonymous: true },
   );
 
-  // Variables for navigation and fiction info
-  let navInfo = { prevUrl: null as string | null, nextUrl: null as string | null };
-  let fictionInfo = { fictionId: 0, fictionTitle: "", fictionUrl: "" };
-
-  if (page) {
-    // Wait for "Mark as Read" when reading live (only with browser)
-    if (!isPreCaching) {
-      await page.waitForTimeout(2000);
-    }
-
-    // Get navigation info via JS evaluation
-    navInfo = await page.evaluate(() => {
-      let prevUrl = null;
-      let nextUrl = null;
-      
-      const navButtons = document.querySelector('.nav-buttons');
-      if (navButtons) {
-        const links = navButtons.querySelectorAll('a.btn[href*="/chapter/"]');
-        for (const link of links) {
-          const text = link.textContent || '';
-          if (text.includes('Previous')) {
-            prevUrl = link.getAttribute('href');
-          }
-          if (text.includes('Next')) {
-            nextUrl = link.getAttribute('href');
-          }
-        }
-      }
-      
-      return { prevUrl, nextUrl };
-    });
-
-    // Get fiction info via JS evaluation
-    fictionInfo = await page.evaluate(() => {
-      const urlMatch = window.location.href.match(/\/fiction\/(\d+)/);
-      const fictionIdFromUrl = urlMatch ? parseInt(urlMatch[1], 10) : 0;
-      
-      const fictionLink = document.querySelector(".fic-title a, a.fic-title, .fiction-title a, .fic-header a[href*='/fiction/']") ||
-                          document.querySelector(".row a[href*='/fiction/']:not([href*='/chapter/']):not(.btn)");
-      const href = fictionLink?.getAttribute("href") || "";
-      const hrefMatch = href.match(/\/fiction\/(\d+)/);
-      
-      return {
-        fictionId: fictionIdFromUrl || (hrefMatch ? parseInt(hrefMatch[1], 10) : 0),
-        fictionTitle: fictionLink?.textContent?.trim() || "",
-        fictionUrl: href,
-      };
-    });
-
-    await release();
-  } else {
-    // Parse navigation and fiction info from HTML (HTTP fetch path)
-    const { document: doc } = parseHTML(content);
-    
-    // Navigation links
-    const navButtons = doc.querySelector('.nav-buttons');
-    if (navButtons) {
-      const links = navButtons.querySelectorAll('a.btn[href*="/chapter/"]');
-      for (const link of links) {
-        const text = link.textContent || '';
-        const href = link.getAttribute('href');
-        if (text.includes('Previous')) {
-          navInfo.prevUrl = href;
-        }
-        if (text.includes('Next')) {
-          navInfo.nextUrl = href;
-        }
-      }
-    }
-    
-    // Fiction info from link
-    const fictionLink = doc.querySelector(".fic-title a, a.fic-title, .fiction-title a, .fic-header a[href*='/fiction/']") ||
-                        doc.querySelector(".row a[href*='/fiction/']:not([href*='/chapter/']):not(.btn)");
-    if (fictionLink) {
-      const href = fictionLink.getAttribute("href") || "";
-      const hrefMatch = href.match(/\/fiction\/(\d+)/);
-      fictionInfo = {
-        fictionId: hrefMatch ? parseInt(hrefMatch[1], 10) : 0,
-        fictionTitle: fictionLink.textContent?.trim() || "",
-        fictionUrl: href,
-      };
-    }
+  // Royal Road records a chapter as read from a short-lived AJAX call fired
+  // once the page has loaded, so on the browser path give it a moment before
+  // tearing the page down. Skipped when pre-caching: marking a chapter read
+  // because the warmer visited it would be wrong.
+  if (page && !isPreCaching) {
+    await page.waitForTimeout(2000);
   }
+  await release();
 
-  const { document } = parseHTML(content);
+  assertHasContent("chapter content", content, CONTENT_PROBE.chapter);
 
-  // Chapter title
-  const titleEl = document.querySelector("h1.font-white, .chapter-title h1, h1");
-  const title = titleEl?.textContent?.trim() || `Chapter ${chapterId}`;
-
-  // Extract clean content
-  const contentEl = document.querySelector(".chapter-inner.chapter-content, .chapter-content");
-  
-  let cleanContent = "";
-  if (contentEl) {
-    const cloned = contentEl.cloneNode(true) as Element;
-    
-    // Extract hidden classes (anti-piracy text)
-    const hiddenClasses: string[] = [];
-    const styleMatches = content.match(/<style[^>]*>([\s\S]*?)<\/style>/gi) || [];
-    for (const styleBlock of styleMatches) {
-      const ruleMatches = styleBlock.matchAll(/\.([a-zA-Z0-9_-]+)\s*\{[^}]*display\s*:\s*none[^}]*\}/gi);
-      for (const match of ruleMatches) {
-        hiddenClasses.push(match[1]);
-      }
-    }
-    
-    if (hiddenClasses.length > 0) {
-      console.log(`Found ${hiddenClasses.length} hidden classes to remove (anti-piracy)`);
-    }
-    for (const className of hiddenClasses) {
-      cloned.querySelectorAll(`.${className}`).forEach(el => el.remove());
-    }
-    
-    // Remove unwanted elements
-    cloned.querySelectorAll(".author-note, .ad, .portlet, script, .hidden, .ads, iframe, noscript").forEach(el => el.remove());
-    
-    // Clean obfuscated classes
-    cloned.querySelectorAll('[class]').forEach(el => {
-      const classList = el.getAttribute('class') || '';
-      const cleanClasses = classList.split(' ').filter(c => c.length < 20 && !/^[a-z]{20,}$/i.test(c)).join(' ');
-      if (cleanClasses) {
-        el.setAttribute('class', cleanClasses);
-      } else {
-        el.removeAttribute('class');
-      }
-    });
-    
-    // Keep only safe styles. width is allowed so tables keep their authored
-    // column layout — stripped, RR tables auto-size from content and overflow
-    // the reader column (bleeding into the next page on e-ink).
-    cloned.querySelectorAll('[style]').forEach(el => {
-      const style = el.getAttribute('style') || '';
-      const safeStyles: string[] = [];
-      
-      const textAlign = style.match(/text-align:\s*([^;]+)/i);
-      const fontWeight = style.match(/font-weight:\s*([^;]+)/i);
-      const fontStyle = style.match(/font-style:\s*([^;]+)/i);
-      const width = style.match(/(?:^|;)\s*width:\s*(\d+(?:\.\d+)?%|[0-9]+px)/i);
-      
-      if (textAlign) safeStyles.push(`text-align: ${textAlign[1].trim()}`);
-      if (fontWeight) safeStyles.push(`font-weight: ${fontWeight[1].trim()}`);
-      if (fontStyle) safeStyles.push(`font-style: ${fontStyle[1].trim()}`);
-      if (width) safeStyles.push(`width: ${width[1]}`);
-      
-      if (safeStyles.length > 0) {
-        el.setAttribute('style', safeStyles.join('; '));
-      } else {
-        el.removeAttribute('style');
-      }
-    });
-    
-    // Mark multi-column tables as responsive. RR's cell widths target desktop
-    // layouts; keeping them with a large e-ink font makes useful columns too
-    // narrow. The reader's auto layout will size columns from their content.
-    cloned.querySelectorAll('table').forEach((table) => {
-      const widthRow = [...table.querySelectorAll('tr')].find((row) => {
-        const cells = [...row.querySelectorAll(':scope > td, :scope > th')];
-        return cells.length > 1 && cells.every((c) =>
-          !c.getAttribute('colspan') && /width\s*:\s*\d/.test(c.getAttribute('style') || '')
-        );
-      });
-      if (!widthRow) return;
-      const rows = [...table.querySelectorAll('tr')];
-      const columnCount = Math.max(0, ...rows.map((row) =>
-        [...row.querySelectorAll(':scope > td, :scope > th')]
-          .reduce((count, cell) => count + Number(cell.getAttribute('colspan') || 1), 0)
-      ));
-      const classes = ['responsive-table'];
-      if (columnCount >= 4 || rows.length >= 8) classes.push('large-table');
-      table.setAttribute('class', `${table.getAttribute('class') || ''} ${classes.join(' ')}`.trim());
-      table.querySelectorAll('td, th').forEach((cell) => {
-        const style = cell.getAttribute('style') || '';
-        const withoutWidth = style
-          .replace(/(?:^|;)\s*width\s*:\s*[^;]+;?/i, '')
-          .replace(/^\s*;|;\s*$/g, '')
-          .trim();
-        if (withoutWidth) cell.setAttribute('style', withoutWidth);
-        else cell.removeAttribute('style');
-      });
-    });
-    
-    cleanContent = cloned.innerHTML;
-    
-    if (shouldPrependTitle(title, cleanContent)) {
-      cleanContent = `<h2 class="chapter-title-prepended">${escapeHtml(title)}</h2>\n${cleanContent}`;
-    }
-  }
+  const parsed = parseChapterPage(content, chapterId);
+  const navInfo = { prevUrl: parsed.prevChapterUrl ?? null, nextUrl: parsed.nextChapterUrl ?? null };
+  const fictionInfo = {
+    fictionId: parsed.fictionId,
+    fictionTitle: parsed.fictionTitle,
+    fictionUrl: parsed.fictionId ? `/fiction/${parsed.fictionId}` : "",
+  };
 
   // Convert nav URLs to proxy URLs
   const prevChapterUrl = navInfo.prevUrl ? navInfo.prevUrl.replace(/.*\/chapter\/(\d+).*/, "/chapter/$1") : undefined;
@@ -1661,21 +1054,23 @@ export async function getChapter(
   const result: ChapterContent = {
     id: chapterId,
     fictionId: fictionInfo.fictionId,
-    title,
-    content: cleanContent,
+    title: parsed.title,
+    content: parsed.content,
     prevChapterUrl,
     nextChapterUrl,
     fictionTitle: fictionInfo.fictionTitle,
     fictionUrl: `/fiction/${fictionInfo.fictionId}`,
   };
 
-  setCache(cacheKey, JSON.stringify(result), ttl ?? CACHE_TTL.CHAPTER);
+  setCache(cacheKey, JSON.stringify(result), ttl ?? CHAPTER_CACHE_TTL);
 
   if (!isPreCaching && userId) {
+    // Invalidate this user's fiction row so the fiction page shows fresh
+    // read/continue state. Scoped by prefix: only this fiction, only this user.
     if (fictionInfo.fictionId) {
-      const fictionCacheKey = `fiction:${fictionInfo.fictionId}`;
-      if (deleteCache(fictionCacheKey)) {
-        console.log(`Invalidated fiction cache: ${fictionCacheKey}`);
+      const staleFictionKey = fictionCacheKey(fictionInfo.fictionId, userId);
+      if (deleteCache(staleFictionKey)) {
+        console.log(`Invalidated fiction cache: ${staleFictionKey}`);
       }
     }
     const followsCacheKey = `follows:${userId}`;
@@ -1686,13 +1081,13 @@ export async function getChapter(
 
   if (nextChapterId && !isPreCaching) {
     console.log(`Pre-caching next chapter: ${nextChapterId}`);
-    setTimeout(async () => {
-      try {
-        await getChapter(nextChapterId, undefined, CACHE_TTL.CHAPTER);
-      } catch (e) {
-        console.error(`Failed to pre-cache chapter ${nextChapterId}:`, e);
-      }
-    }, 100);
+    // Serialised: the warmer shares the anonymous browser context with live
+    // reads, and concurrent pages on it stall behind each other's navigations.
+    preCacheChain = preCacheChain
+      .then(async () => {
+        await getChapter(nextChapterId, userId, CHAPTER_CACHE_TTL);
+      })
+      .catch((e) => console.error(`Failed to pre-cache chapter ${nextChapterId}:`, e));
   }
 
   return result;
@@ -1701,22 +1096,36 @@ export async function getChapter(
 export async function validateCookies(userId: string): Promise<boolean> {
   try {
     await createContext(userId);
-    const { page, content, release } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, undefined, userId);
+    const { content, release } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, undefined, userId);
     await release();
-    
-    const valid = !content.includes('action="/account/login"') && !content.includes("Sign In");
-    
-    if (!valid && ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
-      console.log("[Scraper] Cookie validation failed, attempting auto-login...");
-      const loggedIn = await performAutoLogin(userId);
-      if (loggedIn) {
-        await createContext(userId);
-        const { page: retryPage, content: retryContent, release: retryRelease } = await getPage(`${ROYAL_ROAD_BASE_URL}/my/follows`, undefined, userId, true);
-        await retryRelease();
-        return !retryContent.includes('action="/account/login"') && !retryContent.includes("Sign In");
+
+    // A rejected session lands on the login page, whose title is "Sign In".
+    const valid = !looksLikeLoginPage(content) && !content.includes("Sign In");
+
+    if (!valid) {
+      markSessionDead(userId);
+      if (ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
+        console.log("[Scraper] Cookie validation failed, attempting auto-login...");
+        const loggedIn = await performAutoLogin(userId);
+        if (loggedIn) {
+          clearSessionState(userId);
+          await createContext(userId);
+          const { content: retryContent, release: retryRelease } = await getPage(
+            `${ROYAL_ROAD_BASE_URL}/my/follows`,
+            undefined,
+            userId,
+            { alreadyRetriedWithLogin: true },
+          );
+          await retryRelease();
+          const retryValid = !looksLikeLoginPage(retryContent) && !retryContent.includes("Sign In");
+          if (!retryValid) markSessionDead(userId);
+          return retryValid;
+        }
       }
+    } else {
+      clearSessionState(userId);
     }
-    
+
     return valid;
   } catch (e) {
     console.error("Cookie validation failed:", e);
@@ -1726,12 +1135,27 @@ export async function validateCookies(userId: string): Promise<boolean> {
 
 export async function searchFictions(query: string, userId?: string): Promise<Fiction[]> {
   const encodedQuery = encodeURIComponent(query);
+  const cacheKey = `search:${query.trim().toLowerCase()}`;
+
+  const cached = getCache(cacheKey);
+  if (cached) {
+    console.log(`Returning cached search: ${query}`);
+    return JSON.parse(cached);
+  }
+
   const searchUrl = `${ROYAL_ROAD_BASE_URL}/fictions/search?title=${encodedQuery}`;
-  
-  const { page, content, release } = await getPage(searchUrl, ".fiction-list-item", userId);
+
+  const { content, release } = await getPage(searchUrl, ".fiction-list-item", userId, { allowAnonymous: true });
   await release();
-  
-  return parseFictionList(content);
+
+  const fictions = parseFictionList(content);
+
+  if (fictions.length > 0) {
+    // Cache the empty result too, otherwise a no-hit search re-scrapes forever.
+    setCache(cacheKey, JSON.stringify(fictions), SEARCH_CACHE_TTL);
+  }
+
+  return fictions;
 }
 
 export async function setBookmark(
@@ -1742,15 +1166,15 @@ export async function setBookmark(
   csrfToken: string
 ): Promise<{ success: boolean; error?: string }> {
   const url = `${ROYAL_ROAD_BASE_URL}/fictions/setbookmark/${fictionId}`;
-  
+
   const formData = new URLSearchParams();
   formData.append("type", type);
   formData.append("mark", mark ? "True" : "False");
   formData.append("__RequestVerificationToken", csrfToken);
-  
+
   try {
     console.log(`[Scraper] Setting bookmark: fiction=${fictionId}, type=${type}, mark=${mark}`);
-    
+
     const response = await fetch(url, {
       method: "POST",
       headers: {
@@ -1761,19 +1185,30 @@ export async function setBookmark(
       body: formData.toString(),
       redirect: "manual",  // Don't follow redirects automatically
     });
-    
+
     // Success is typically 200 or 302 redirect
     if (response.ok || response.status === 302) {
       console.log(`[Scraper] Bookmark set successfully`);
-      
-      // Invalidate caches so we get fresh state
-      deleteCache(`fiction:${fictionId}`);
+
+      // Invalidate caches so we get fresh state. Fiction rows are per user, so
+      // drop every user's copy of this fiction — the antiforgery token and the
+      // follow state are both stale now.
+      deleteCacheByPrefix(`fiction:${fictionId}:`);
       deleteCache(`follows:${userId}`);
       deleteCache(`readlater:${userId}`);
-      
+
       return { success: true };
     }
-    
+
+    if (response.status === 400 || response.status === 403) {
+      console.error(`[Scraper] Bookmark rejected (${response.status}) - stale antiforgery token or session`);
+      markSessionDead(userId);
+      return {
+        success: false,
+        error: "Royal Road rejected the request. Re-open the fiction page to refresh your session.",
+      };
+    }
+
     console.error(`[Scraper] Bookmark failed with status: ${response.status}`);
     return { success: false, error: `Request failed (${response.status})` };
   } catch (error) {
