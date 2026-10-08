@@ -6,8 +6,14 @@ import type { Database } from "bun:sqlite";
 import { AUTH_USERNAME } from "tome";
 
 export function migrateRoyalRoad(db: Database): void {
-  migrateGlobalCookiesToAdmin(db);
-  autoEnableRoyalRoadForExistingUsers(db);
+  // A migration failure must never stop Tome from starting. This plugin is a
+  // scraper; it has no business being able to take the whole app down.
+  try {
+    migrateGlobalCookiesToAdmin(db);
+    autoEnableRoyalRoadForExistingUsers(db);
+  } catch (e) {
+    console.error("[royalroad] Migration failed; continuing without it:", e);
+  }
 }
 
 /**
@@ -95,8 +101,16 @@ function migrateGlobalCookiesToAdmin(db: Database): void {
 }
 
 function autoEnableRoyalRoadForExistingUsers(db: Database): void {
+  // Join against the user table: user_sources has a foreign key on userId, and
+  // a credential row owned by a non-user makes the blind INSERT fail. The
+  // shared Cloudflare clearance is deliberately stored under a sentinel owner,
+  // and a credential row for a deleted user is just as possible — either would
+  // crash startup, which took the whole app down.
   const usersWithCredentials = db.query(`
-    SELECT DISTINCT userId FROM "user_source_credentials" WHERE source = 'royalroad'
+    SELECT DISTINCT c.userId AS userId
+    FROM "user_source_credentials" c
+    JOIN "user" u ON u.id = c.userId
+    WHERE c.source = 'royalroad'
   `).all() as { userId: string }[];
 
   if (usersWithCredentials.length === 0) {
@@ -108,7 +122,18 @@ function autoEnableRoyalRoadForExistingUsers(db: Database): void {
     VALUES (?, 'royalroad', 1)
   `);
 
+  let enabled = 0;
   for (const { userId } of usersWithCredentials) {
-    insertStmt.run(userId);
+    // One bad row must never stop the others, let alone the boot.
+    try {
+      insertStmt.run(userId);
+      enabled++;
+    } catch (e) {
+      console.error(`Failed to auto-enable Royal Road for user ${userId}:`, e);
+    }
+  }
+
+  if (enabled > 0) {
+    console.log(`Royal Road auto-enabled for ${enabled} user(s) with saved credentials`);
   }
 }
