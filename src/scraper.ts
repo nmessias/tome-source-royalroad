@@ -71,6 +71,50 @@ const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const CHALLENGE_WAIT_MS = parseInt(process.env.ROYAL_ROAD_CHALLENGE_WAIT_MS || String(20 * 1000), 10);
 const CHALLENGE_ATTEMPTS = 2;
 
+/**
+ * Caps how many browser fetches run at the same time.
+ *
+ * A Cloudflare-challenged fetch holds a Chromium page for up to a minute. With
+ * the previous unbounded behaviour, a handful of concurrent chapter requests
+ * each doing that saturated a 2-CPU machine badly enough that it stopped
+ * answering even /health — the app itself, not Royal Road, was the thing that
+ * broke.
+ */
+const MAX_CONCURRENT_BROWSER_FETCHES = parseInt(
+  process.env.ROYAL_ROAD_MAX_BROWSER_FETCHES || "4",
+  10
+);
+
+/** Minimal counting semaphore with an idempotent release. */
+class Semaphore {
+  private active = 0;
+  private waiting: (() => void)[] = [];
+
+  constructor(private readonly max: number) {}
+
+  /** Resolves once a slot is free; the returned fn frees it again. */
+  async acquire(): Promise<() => void> {
+    while (this.active >= this.max) {
+      await new Promise<void>((resolve) => this.waiting.push(resolve));
+    }
+    this.active++;
+    return this.makeRelease();
+  }
+
+  private makeRelease(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.active--;
+      const next = this.waiting.shift();
+      if (next) next();
+    };
+  }
+}
+
+const browserSlots = new Semaphore(MAX_CONCURRENT_BROWSER_FETCHES);
+
 // ============ Cache keys ============
 
 /**
@@ -718,7 +762,12 @@ export async function getPage(
     }
   });
 
+  // Hold a slot for as long as this request owns a page. Released from
+  // closeOwned, which every return and error path funnels through.
+  const releaseSlot = await browserSlots.acquire();
+
   const closeOwned = async () => {
+    releaseSlot();
     for (const c of requestContexts) {
       inFlightContexts.delete(c);
       try { await c.close(); } catch {}
