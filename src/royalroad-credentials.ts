@@ -45,6 +45,13 @@ export function getRoyalRoadCookie(userId: string, name: string): string | null 
 
 export function setRoyalRoadCookie(userId: string, name: string, value: string): void {
   setUserCredential(userId, SOURCE, name, value);
+
+  // cf_clearance is bound to this machine's IP, not to a user, so every copy
+  // the plugin learns — from a browser visit, from auto-login, or pasted into
+  // Settings — is mirrored into the shared slot. Without this, a clearance the
+  // user pastes by hand is ignored by anonymous fetches (public pages), which
+  // is exactly when it is needed most.
+  if (name === "cf_clearance") setSharedCookie(name, value);
 }
 
 export function hasRoyalRoadSession(userId: string): boolean {
