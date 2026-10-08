@@ -12,11 +12,14 @@ import {
   getRoyalRoadCookiesForPlaywright,
   hasRoyalRoadSession,
   setRoyalRoadCookie,
+  getSharedCookie,
+  setSharedCookie,
   markSessionDead,
   clearSessionState,
   isSessionKnownDead,
 } from "./royalroad-credentials";
 import { deleteCacheByPrefix } from "./cache";
+import { buildCookieHeader } from "./cookie-header";
 import {
   ROYAL_ROAD_BASE_URL,
   ROYAL_ROAD_USERNAME,
@@ -58,6 +61,11 @@ const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image']
 
 // HTTP fetch user agent (same as Playwright context)
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+// How long to sit on a Cloudflare challenge before giving up on it. A managed
+// challenge runs JS and can take tens of seconds on a cold browser, so this is
+// deliberately much longer than a selector timeout.
+const CHALLENGE_WAIT_MS = parseInt(process.env.ROYAL_ROAD_CHALLENGE_WAIT_MS || String(45 * 1000), 10);
 
 // ============ Cache keys ============
 
@@ -105,26 +113,43 @@ async function parallelLimit<T>(
   await Promise.all(executing);
 }
 
-/** Cookies formatted as an HTTP Cookie header string for a specific user. */
+/**
+ * Cookies for an HTTP fetch: the user's own session when there is one, plus the
+ * shared Cloudflare clearance.
+ *
+ * The clearance is sent even for anonymous requests — it is bound to this
+ * machine's IP, not to a user, and without it every public fetch went out bare
+ * and re-challenged from scratch.
+ */
 function getCookiesForFetch(userId?: string): string {
-  if (!userId) return "";
-  const cookies = getRoyalRoadCookiesForPlaywright(userId);
-  return cookies.map((c: { name: string; value: string }) => `${c.name}=${c.value}`).join("; ");
+  return buildCookieHeader(
+    userId ? getRoyalRoadCookiesForPlaywright(userId) : undefined,
+    getSharedCookie("cf_clearance")
+  );
 }
 
 /**
  * Persist cookies learned from a browser visit. Royal Road rotates the
  * session cookie on use, so keeping the freshest copy stops the fast HTTP
  * path from drifting into "logged out" on a long-lived deployment.
+ *
+ * The Cloudflare clearance is stored process-wide rather than per user: both
+ * contexts solve challenges, and the anonymous one solved them constantly
+ * while its result was discarded.
  */
 async function rememberCookiesFromBrowser(ctx: BrowserContext, userId?: string): Promise<void> {
-  if (!userId) return;
   try {
     const cookies = await ctx.cookies();
-    const identity = cookies.find((c) => c.name === ".AspNetCore.Identity.Application");
-    if (identity) setRoyalRoadCookie(userId, identity.name, identity.value);
+
+    if (userId) {
+      const identity = cookies.find((c) => c.name === ".AspNetCore.Identity.Application");
+      if (identity) setRoyalRoadCookie(userId, identity.name, identity.value);
+      const userClearance = cookies.find((c) => c.name === "cf_clearance");
+      if (userClearance) setRoyalRoadCookie(userId, "cf_clearance", userClearance.value);
+    }
+
     const clearance = cookies.find((c) => c.name === "cf_clearance");
-    if (clearance) setRoyalRoadCookie(userId, "cf_clearance", clearance.value);
+    if (clearance) setSharedCookie("cf_clearance", clearance.value);
   } catch (e) {
     console.error("Failed to persist cookies from browser context:", e);
   }
@@ -164,10 +189,10 @@ async function tryHttpFetch(
       "Accept-Language": "en-US,en;q=0.5",
     };
 
-    if (userId) {
-      const cookieHeader = getCookiesForFetch(userId);
-      if (cookieHeader) headers["Cookie"] = cookieHeader;
-    }
+    // Sent for anonymous requests too: the shared Cloudflare clearance is not
+    // user-bound, and skipping it made every public fetch re-challenge.
+    const cookieHeader = getCookiesForFetch(userId);
+    if (cookieHeader) headers["Cookie"] = cookieHeader;
 
     const response = await fetch(url, {
       method: "GET",
@@ -324,6 +349,8 @@ export async function createContext(userId: string): Promise<void> {
     timezoneId: "America/New_York",
   });
 
+  await seedClearance(context);
+
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
@@ -335,6 +362,24 @@ export async function createContext(userId: string): Promise<void> {
     console.log(`Loaded ${cookies.length} cookies into auth context`);
   } else {
     console.warn("WARNING: No cookies loaded into auth context!");
+  }
+}
+
+/**
+ * Add any stored Cloudflare clearance to a fresh browser context.
+ *
+ * Without this the browser re-solved the challenge on every request even
+ * though a valid clearance was already sitting in the database, because only
+ * the HTTP path ever read it back.
+ */
+async function seedClearance(ctx: BrowserContext): Promise<void> {
+  const clearance = getSharedCookie("cf_clearance");
+  if (!clearance) return;
+  try {
+    await ctx.addCookies([{ name: "cf_clearance", value: clearance, domain: ".royalroad.com", path: "/" }]);
+    console.log("[Scraper] Seeded the browser context with the stored Cloudflare clearance");
+  } catch (e) {
+    console.error("Failed to seed the Cloudflare clearance:", e);
   }
 }
 
@@ -353,6 +398,8 @@ async function createAnonContext(): Promise<void> {
     locale: "en-US",
     timezoneId: "America/New_York",
   });
+
+  await seedClearance(anonContext);
 
   await anonContext.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
@@ -543,16 +590,23 @@ export /**
  * Wait for an in-flight Cloudflare challenge to finish, in place.
  *
  * Re-navigating restarts the challenge and burns an attempt, so the page is
- * left alone and its title polled until it stops naming a challenge.
+ * left alone and polled until it stops naming a challenge. A managed challenge
+ * on a cold browser can take a while to run, so the wait is generous and
+ * success is also accepted when the URL leaves the challenge host.
  */
-async function waitForChallengeToClear(page: Page): Promise<boolean> {
-  const deadline = Date.now() + SCRAPER_SELECTOR_TIMEOUT;
+async function waitForChallengeToClear(page: Page, url: string): Promise<boolean> {
+  const deadline = Date.now() + CHALLENGE_WAIT_MS;
+  const challengeHost = new URL(url).hostname;
+
   while (Date.now() < deadline) {
     await page.waitForTimeout(1000);
     try {
-      const title = await page.title();
-      if (!/just a moment|attention required|checking your browser|cloudflare/i.test(title)) {
-        return true;
+      // Cloudflare redirects to the real page once the challenge passes.
+      if (!page.url().includes("challenges.cloudflare.com") && page.url().includes(challengeHost)) {
+        const title = await page.title();
+        if (!/just a moment|attention required|checking your browser|cloudflare/i.test(title)) {
+          return true;
+        }
       }
     } catch {
       // Page navigated underneath us — that is the challenge clearing.
@@ -562,7 +616,7 @@ async function waitForChallengeToClear(page: Page): Promise<boolean> {
   return false;
 }
 
-async function getPage(
+export async function getPage(
   url: string,
   waitForSelector?: string,
   userId?: string,
@@ -590,7 +644,8 @@ async function getPage(
   }
 
   // With a public page and no usable session, go straight to anonymous: there
-  // is nothing an authenticated fetch would add.
+  // is nothing an authenticated fetch would add. The shared Cloudflare
+  // clearance still goes out (see getCookiesForFetch).
   const wantAuth = !!userId && hasSession && !(allowAnonymous && isSessionKnownDead(userId));
   console.log(`[Scraper] Trying HTTP fetch for ${url} (${wantAuth ? 'auth' : 'anon'})`);
 
@@ -693,7 +748,7 @@ async function getPage(
       // a fresh goto would restart it and burn an attempt.
       if (looksLikeChallenge(pageContent)) {
         console.log(`[Scraper] Cloudflare challenge on ${url} (attempt ${attempts}), waiting for it to clear...`);
-        await waitForChallengeToClear(page);
+        await waitForChallengeToClear(page, url);
         pageContent = await page.content();
 
         if (looksLikeChallenge(pageContent)) {
@@ -777,7 +832,12 @@ async function getPage(
       return { page, content, release };
     }
 
-    throw new Error("Failed to bypass Cloudflare after multiple attempts");
+    throw new Error(
+      "Cloudflare would not let the browser through after several attempts. " +
+      "This is normally transient — wait a minute and reload. If it keeps happening, " +
+      "the server's IP is likely flagged; paste a fresh cf_clearance cookie in " +
+      "Settings > Royal Road to give it a head start."
+    );
   } catch (error) {
     try { await page.close(); } catch {}
     await closeOwned();
