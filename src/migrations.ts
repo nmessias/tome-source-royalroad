@@ -14,6 +14,32 @@ export function migrateRoyalRoad(db: Database): void {
  * Migrate cookies from the old global `cookies` table to the admin user's credentials
  * This runs once when upgrading to multi-user support
  */
+/**
+ * Find the user the legacy global cookies belong to.
+ *
+ * Primary key is AUTH_USERNAME, but auth is optional in Tome — when it is
+ * disabled that variable is empty and the migration used to silently do
+ * nothing, orphaning the old cookies. Fall back to the admin-role user, then to
+ * the oldest account, so the migration always has a target.
+ */
+function findMigrationTarget(db: Database): { id: string } | null {
+  if (AUTH_USERNAME) {
+    const byUsername = db
+      .query(`SELECT id FROM "user" WHERE username = ?`)
+      .get(AUTH_USERNAME) as { id: string } | null;
+    if (byUsername) return byUsername;
+  }
+
+  const byRole = db
+    .query(`SELECT id FROM "user" WHERE role = 'admin' ORDER BY createdAt ASC LIMIT 1`)
+    .get() as { id: string } | null;
+  if (byRole) return byRole;
+
+  return db
+    .query(`SELECT id FROM "user" ORDER BY createdAt ASC LIMIT 1`)
+    .get() as { id: string } | null;
+}
+
 function migrateGlobalCookiesToAdmin(db: Database): void {
   // Check if old cookies table exists
   const tablesResult = db.query(
@@ -25,9 +51,7 @@ function migrateGlobalCookiesToAdmin(db: Database): void {
   }
 
   // Find admin user by username
-  const adminUser = db.query(
-    `SELECT id FROM "user" WHERE username = ?`
-  ).get(AUTH_USERNAME) as { id: string } | null;
+  const adminUser = findMigrationTarget(db);
 
   if (!adminUser) {
     console.log("No admin user found yet, skipping cookie migration");

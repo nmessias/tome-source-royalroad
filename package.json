@@ -24,7 +24,9 @@
     }
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "fixtures": "bun run test/build-fixtures.ts"
   },
   "dependencies": {
     "linkedom": "^0.16.0",
