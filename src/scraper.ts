@@ -12,14 +12,11 @@ import {
   getRoyalRoadCookiesForPlaywright,
   hasRoyalRoadSession,
   setRoyalRoadCookie,
-  getSharedCookie,
-  setSharedCookie,
   markSessionDead,
   clearSessionState,
   isSessionKnownDead,
 } from "./royalroad-credentials";
 import { deleteCacheByPrefix } from "./cache";
-import { buildCookieHeader } from "./cookie-header";
 import {
   ROYAL_ROAD_BASE_URL,
   ROYAL_ROAD_USERNAME,
@@ -162,18 +159,19 @@ async function parallelLimit<T>(
 }
 
 /**
- * Cookies for an HTTP fetch: the user's own session when there is one, plus the
- * shared Cloudflare clearance.
+ * Cookies for an HTTP fetch.
  *
- * The clearance is sent even for anonymous requests — it is bound to this
- * machine's IP, not to a user, and without it every public fetch went out bare
- * and re-challenged from scratch.
+ * Note what is deliberately NOT here: a `cf_clearance`. Plain `fetch` from a
+ * server is blocked by Cloudflare on its TLS fingerprint, not on its cookies,
+ * so re-sending a stored clearance buys nothing — and a clearance that has
+ * gone stale makes Cloudflare treat the request as forged. The browser is the
+ * only path that gets through, and it earns its own clearance.
  */
 function getCookiesForFetch(userId?: string): string {
-  return buildCookieHeader(
-    userId ? getRoyalRoadCookiesForPlaywright(userId) : undefined,
-    getSharedCookie("cf_clearance")
-  );
+  if (!userId) return "";
+  return getRoyalRoadCookiesForPlaywright(userId)
+    .map((c: { name: string; value: string }) => `${c.name}=${c.value}`)
+    .join("; ");
 }
 
 /**
@@ -181,23 +179,15 @@ function getCookiesForFetch(userId?: string): string {
  * session cookie on use, so keeping the freshest copy stops the fast HTTP
  * path from drifting into "logged out" on a long-lived deployment.
  *
- * The Cloudflare clearance is stored process-wide rather than per user: both
- * contexts solve challenges, and the anonymous one solved them constantly
- * while its result was discarded.
+ * The Cloudflare clearance is deliberately not saved: it is bound to this
+ * machine's IP, and a stored one is stale by the time anything reads it back.
  */
 async function rememberCookiesFromBrowser(ctx: BrowserContext, userId?: string): Promise<void> {
+  if (!userId) return;
   try {
     const cookies = await ctx.cookies();
-
-    if (userId) {
-      const identity = cookies.find((c) => c.name === ".AspNetCore.Identity.Application");
-      if (identity) setRoyalRoadCookie(userId, identity.name, identity.value);
-      const userClearance = cookies.find((c) => c.name === "cf_clearance");
-      if (userClearance) setRoyalRoadCookie(userId, "cf_clearance", userClearance.value);
-    }
-
-    const clearance = cookies.find((c) => c.name === "cf_clearance");
-    if (clearance) setSharedCookie("cf_clearance", clearance.value);
+    const identity = cookies.find((c) => c.name === ".AspNetCore.Identity.Application");
+    if (identity) setRoyalRoadCookie(userId, identity.name, identity.value);
   } catch (e) {
     console.error("Failed to persist cookies from browser context:", e);
   }
@@ -385,7 +375,10 @@ export async function createContext(userId: string): Promise<void> {
     try { await context.close(); } catch {}
   }
 
-  const cookies = getRoyalRoadCookiesForPlaywright(userId);
+  const cookies = getRoyalRoadCookiesForPlaywright(userId)
+    // A cf_clearance from another machine is invalid here and poisons the
+    // request, so it is dropped rather than loaded.
+    .filter((c: { name: string }) => c.name !== "cf_clearance");
   console.log(`Creating context with ${cookies.length} cookies: ${cookies.map((c: { name: string }) => c.name).join(", ")}`);
 
   // No userAgent override: claiming a Chrome UA from a Firefox build (or from a
@@ -396,8 +389,6 @@ export async function createContext(userId: string): Promise<void> {
     locale: "en-US",
     timezoneId: "America/New_York",
   });
-
-  await seedClearance(context);
 
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
@@ -413,24 +404,6 @@ export async function createContext(userId: string): Promise<void> {
   }
 }
 
-/**
- * Add any stored Cloudflare clearance to a fresh browser context.
- *
- * Without this the browser re-solved the challenge on every request even
- * though a valid clearance was already sitting in the database, because only
- * the HTTP path ever read it back.
- */
-async function seedClearance(ctx: BrowserContext): Promise<void> {
-  const clearance = getSharedCookie("cf_clearance");
-  if (!clearance) return;
-  try {
-    await ctx.addCookies([{ name: "cf_clearance", value: clearance, domain: ".royalroad.com", path: "/" }]);
-    console.log("[Scraper] Seeded the browser context with the stored Cloudflare clearance");
-  } catch (e) {
-    console.error("Failed to seed the Cloudflare clearance:", e);
-  }
-}
-
 async function createAnonContext(): Promise<void> {
   if (!ENABLE_BROWSER || !browser) {
     if (ENABLE_BROWSER) await initBrowser();
@@ -441,13 +414,15 @@ async function createAnonContext(): Promise<void> {
     await anonContext.close();
   }
 
+  // Deliberately cookie-free. A cf_clearance is bound to the IP and browser
+  // that solved the challenge; re-sending a stored one makes Cloudflare treat
+  // the request as forged and serve a challenge that never clears. The browser
+  // earns a fresh clearance on its first successful navigation.
   anonContext = await browser.newContext({
     viewport: { width: 1280, height: 720 },
     locale: "en-US",
     timezoneId: "America/New_York",
   });
-
-  await seedClearance(anonContext);
 
   await anonContext.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
@@ -583,16 +558,15 @@ export async function performBrowserLogin(userId: string, opts: { force?: boolea
 function assertHasContent(label: string, content: string, probe: RegExp): void {
   if (probe.test(content)) return;
 
-  // A challenge that never cleared is a different problem from a locked
-  // chapter, and the user needs to be able to tell them apart.
   if (looksLikeChallenge(content)) {
     const title = (content.match(/<title>([\s\S]*?)<\/title>/i)?.[1] || "")
       .replace(/\s+/g, ' ')
       .trim();
     throw new Error(
-      `Cloudflare did not let the request through for ${label}` +
+      `Cloudflare blocked the request for ${label}` +
       (title ? ` (page: "${title}")` : "") +
-      `. This is usually transient — reload in a moment.`
+      `. Cloudflare judges the server's IP, so this is not something the plugin ` +
+      `can work around — retrying will not help.`
     );
   }
 
@@ -887,9 +861,8 @@ export async function getPage(
 
     throw new Error(
       "Cloudflare would not let the browser through after several attempts. " +
-      "This is normally transient — wait a minute and reload. If it keeps happening, " +
-      "the server's IP is likely flagged; paste a fresh cf_clearance cookie in " +
-      "Settings > Royal Road to give it a head start."
+      "Cloudflare is judging the server's IP address, so waiting longer will not " +
+      "help — this needs a network Cloudflare trusts, not a code change."
     );
   } catch (error) {
     try { await page.close(); } catch {}

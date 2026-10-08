@@ -42,8 +42,8 @@ afterAll(() => {
   try { rmSync("./data/test-rr-migrations.db-journal"); } catch {}
 });
 
-/** The sentinel the plugin uses for the IP-bound shared clearance. */
-const SHARED_OWNER = "__shared__";
+/** A credential row owned by something that is not a user — e.g. a leftover sentinel owner, or a user who has been deleted. */
+const ORPHAN_OWNER = "__shared__";
 
 function seed(): void {
   // user_sources cascades from user; clear children first anyway.
@@ -58,7 +58,7 @@ function seed(): void {
           VALUES ('real-user', 'royalroad', '.AspNetCore.Identity.Application', 'IDENT', 1)`);
   // The crash trigger: a credential row owned by something that is not a user.
   db.run(`INSERT INTO "user_source_credentials" (userId, source, name, value, updatedAt)
-          VALUES ('${SHARED_OWNER}', 'royalroad', 'cf_clearance', 'CLEARANCE', 1)`);
+          VALUES ('${ORPHAN_OWNER}', 'royalroad', 'cf_clearance', 'CLEARANCE', 1)`);
 }
 
 describe("royalroad migrations", () => {
@@ -69,7 +69,7 @@ describe("royalroad migrations", () => {
       SELECT DISTINCT userId FROM "user_source_credentials" WHERE source = 'royalroad'
     `).all() as { userId: string }[];
 
-    expect(all.map((r) => r.userId).sort()).toEqual([SHARED_OWNER, "real-user"]);
+    expect(all.map((r) => r.userId).sort()).toEqual([ORPHAN_OWNER, "real-user"]);
 
     let threw: unknown = null;
     try {

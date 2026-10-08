@@ -45,13 +45,6 @@ export function getRoyalRoadCookie(userId: string, name: string): string | null 
 
 export function setRoyalRoadCookie(userId: string, name: string, value: string): void {
   setUserCredential(userId, SOURCE, name, value);
-
-  // cf_clearance is bound to this machine's IP, not to a user, so every copy
-  // the plugin learns — from a browser visit, from auto-login, or pasted into
-  // Settings — is mirrored into the shared slot. Without this, a clearance the
-  // user pastes by hand is ignored by anonymous fetches (public pages), which
-  // is exactly when it is needed most.
-  if (name === "cf_clearance") setSharedCookie(name, value);
 }
 
 export function hasRoyalRoadSession(userId: string): boolean {
@@ -98,32 +91,6 @@ export function isSessionKnownDead(userId: string): boolean {
 
 export function clearRoyalRoadCookies(userId: string): void {
   clearUserCredentials(userId, SOURCE);
-}
-
-// ============ Process-wide cookies ============
-
-/**
- * `cf_clearance` is bound to the IP and browser that solved the Cloudflare
- * challenge, not to a Tome user. Storing it per user meant an anonymous
- * request — which is what public fiction/chapter/search pages use — sent no
- * cookies at all and never benefited from a clearance any other request had
- * already earned, so every read re-challenged from scratch.
- *
- * It lives under a sentinel owner so it survives credential changes and is
- * shared by every user on the instance.
- */
-const SHARED_OWNER = "__shared__";
-
-export function setSharedCookie(name: string, value: string): void {
-  setUserCredential(SHARED_OWNER, SOURCE, name, value);
-}
-
-export function getSharedCookie(name: string): string | null {
-  return getUserCredential(SHARED_OWNER, SOURCE, name)?.value ?? null;
-}
-
-export function clearSharedCookies(): void {
-  clearUserCredentials(SHARED_OWNER, SOURCE);
 }
 
 export function hasAnyRoyalRoadCredentials(userId: string): boolean {
