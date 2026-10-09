@@ -28,6 +28,7 @@ import {
   BROWSER_HEADLESS,
   BROWSER_PROXY,
   isThirdParty,
+  isUnreachable,
   CHAPTER_CACHE_TTL,
   SEARCH_CACHE_TTL,
   AUTO_LOGIN_COOLDOWN_MS,
@@ -135,6 +136,34 @@ export type FollowedFictionWithRecency = FollowedFiction & {
  */
 function fictionCacheKey(id: number | string, userId?: string): string {
   return `fiction:${id}:${userId ?? "anon"}`;
+}
+
+// ============ Stale-if-error ============
+
+/** How long the last good copy of a list or page is kept for when a live fetch fails. */
+const STALE_TTL = 30 * 24 * 60 * 60;
+const staleKey = (key: string) => `stale:${key}`;
+
+/** setCache, plus a long-lived copy that outlives the normal TTL. */
+function setCacheWithStale(key: string, value: string, ttl: number): void {
+  setCache(key, value, ttl);
+  setCache(staleKey(key), value, STALE_TTL);
+}
+
+/**
+ * Run a live fetch; when Royal Road cannot be reached - e.g. the phone that serves
+ * as the exit node is offline - serve the last good copy instead of an error page.
+ * Rethrows when there is no such copy or the failure is not a connectivity one.
+ */
+async function orStale<T>(key: string, live: () => Promise<T>): Promise<T> {
+  try {
+    return await live();
+  } catch (e) {
+    const stale = isUnreachable(e) ? getCache(staleKey(key)) : null;
+    if (stale === null) throw e;
+    console.warn(`[Cache] ${key}: Royal Road unreachable (${String((e as Error).message).split("\n")[0].slice(0, 90)}) - serving the last good copy`);
+    return JSON.parse(stale) as T;
+  }
 }
 
 // ============ Small helpers ============
@@ -1004,7 +1033,11 @@ function toFollowedFiction(card: ParsedCard): FollowedFictionWithRecency {
   };
 }
 
-export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS): Promise<FollowedFiction[]> {
+export function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS): Promise<FollowedFiction[]> {
+  return orStale(`follows:${userId}`, () => getFollowsLive(userId, ttl));
+}
+
+async function getFollowsLive(userId: string, ttl: number): Promise<FollowedFiction[]> {
   const cacheKey = `follows:${userId}`;
   const cached = getCache(cacheKey);
   if (cached) {
@@ -1066,7 +1099,7 @@ export async function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS
   }
 
   if (fictions.length > 0) {
-    setCache(cacheKey, JSON.stringify(fictions), ttl);
+    setCacheWithStale(cacheKey, JSON.stringify(fictions), ttl);
   }
 
   return fictions;
@@ -1086,7 +1119,11 @@ export async function getHistory(userId: string): Promise<HistoryEntry[]> {
   return history;
 }
 
-export async function getReadLater(userId: string, ttl: number = CACHE_TTL.FOLLOWS): Promise<Fiction[]> {
+export function getReadLater(userId: string, ttl: number = CACHE_TTL.FOLLOWS): Promise<Fiction[]> {
+  return orStale(`readlater:${userId}`, () => getReadLaterLive(userId, ttl));
+}
+
+async function getReadLaterLive(userId: string, ttl: number): Promise<Fiction[]> {
   const cacheKey = `readlater:${userId}`;
   const cached = getCache(cacheKey);
   if (cached) {
@@ -1115,13 +1152,17 @@ export async function getReadLater(userId: string, ttl: number = CACHE_TTL.FOLLO
   }));
 
   if (fictions.length > 0) {
-    setCache(cacheKey, JSON.stringify(fictions), ttl);
+    setCacheWithStale(cacheKey, JSON.stringify(fictions), ttl);
   }
 
   return fictions;
 }
 
-export async function getToplist(toplist: ToplistType, userId?: string, ttl: number = CACHE_TTL.TOPLIST): Promise<Fiction[]> {
+export function getToplist(toplist: ToplistType, userId?: string, ttl: number = CACHE_TTL.TOPLIST): Promise<Fiction[]> {
+  return orStale(`toplist:${toplist.slug}`, () => getToplistLive(toplist, userId, ttl));
+}
+
+async function getToplistLive(toplist: ToplistType, userId: string | undefined, ttl: number): Promise<Fiction[]> {
   const cacheKey = `toplist:${toplist.slug}`;
   const cached = getCache(cacheKey);
   if (cached) {
@@ -1136,7 +1177,7 @@ export async function getToplist(toplist: ToplistType, userId?: string, ttl: num
   const fictions = parseFictionList(content);
 
   if (fictions.length > 0) {
-    setCache(cacheKey, JSON.stringify(fictions), ttl);
+    setCacheWithStale(cacheKey, JSON.stringify(fictions), ttl);
   }
 
   return fictions;
@@ -1151,7 +1192,11 @@ export function getToplistCached(toplist: ToplistType): Fiction[] | null {
   return null;
 }
 
-export async function getFiction(id: number, userId?: string, ttl: number = CACHE_TTL.FICTION): Promise<Fiction | null> {
+export function getFiction(id: number, userId?: string, ttl: number = CACHE_TTL.FICTION): Promise<Fiction | null> {
+  return orStale(fictionCacheKey(id, userId), () => getFictionLive(id, userId, ttl));
+}
+
+async function getFictionLive(id: number, userId: string | undefined, ttl: number): Promise<Fiction | null> {
   const cacheKey = fictionCacheKey(id, userId);
   const cached = getCache(cacheKey);
   if (cached) {
@@ -1171,7 +1216,7 @@ export async function getFiction(id: number, userId?: string, ttl: number = CACH
   // paths used to disagree on the chapter list.
   const parsed = parseFictionPage(content, id, url);
 
-  setCache(cacheKey, JSON.stringify(parsed.fiction), ttl);
+  setCacheWithStale(cacheKey, JSON.stringify(parsed.fiction), ttl);
   return parsed.fiction;
 }
 

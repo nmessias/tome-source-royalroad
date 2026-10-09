@@ -61,6 +61,16 @@ export function isThirdParty(requestUrl: string): boolean {
   }
 }
 
+/**
+ * "Could not reach or get past Royal Road" (exit node down, timeouts, Cloudflare),
+ * as opposed to "Royal Road said no" (rejected session, 404, unparseable page).
+ * Only the former may be answered from an old copy: an expired login must stay
+ * visible, and a removed fiction must not be resurrected.
+ */
+export function isUnreachable(e: unknown): boolean {
+  return /net::ERR_|Timeout \d+ms|Cloudflare/i.test(String((e as Error)?.message));
+}
+
 // Royal Road
 export const ROYAL_ROAD_BASE_URL = "https://www.royalroad.com";
 export const ROYAL_ROAD_USERNAME = process.env.ROYAL_ROAD_USERNAME || "";
