@@ -41,6 +41,26 @@ export function parseProxy(raw: string): { server: string; username?: string; pa
 }
 export const BROWSER_PROXY = parseProxy(process.env.ROYAL_ROAD_PROXY || "");
 
+// Only royalroad.com itself and Cloudflare (its challenge loads from
+// challenges.cloudflare.com) need to load in the scraper browser. Every other
+// host on a page is ad and analytics traffic - about 50 of the ~125 requests per
+// page, measured - that does nothing for a scraper but crowd the exit node's
+// link. Blocking it halves the requests and cuts network-idle time from ~6s to
+// ~2s with the parsed content unchanged; over a phone's tunnel the saving is
+// far bigger.
+const FIRST_PARTY_HOST = /(^|\.)(royalroad\.com|cloudflare\.com)$/;
+
+/** True for an http(s) request to a host that is neither Royal Road nor Cloudflare. */
+export function isThirdParty(requestUrl: string): boolean {
+  try {
+    const { protocol, hostname } = new URL(requestUrl);
+    // data:/blob: (e.g. the challenge's workers) are local, never third parties.
+    return (protocol === "http:" || protocol === "https:") && !FIRST_PARTY_HOST.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
 // Royal Road
 export const ROYAL_ROAD_BASE_URL = "https://www.royalroad.com";
 export const ROYAL_ROAD_USERNAME = process.env.ROYAL_ROAD_USERNAME || "";

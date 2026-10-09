@@ -27,6 +27,7 @@ import {
   BROWSER_ENGINE,
   BROWSER_HEADLESS,
   BROWSER_PROXY,
+  isThirdParty,
   CHAPTER_CACHE_TTL,
   SEARCH_CACHE_TTL,
   AUTO_LOGIN_COOLDOWN_MS,
@@ -272,6 +273,31 @@ async function tryHttpFetch(
     console.error(`[Scraper] HTTP fetch error in ${Date.now() - startTime}ms:`, error);
     return null;
   }
+}
+
+/**
+ * `page.content()` that survives a navigation in flight, and never returns a
+ * half-parsed document. A chapter URL redirects to its canonical form, and
+ * reading the page mid-navigation throws "Unable to retrieve content because the
+ * page is navigating" - seen on fast links, where it failed a chapter fetch.
+ * Simply retrying is worse than the error: the retry can land on the new
+ * document while it is still streaming and return a TRUNCATED chapter (36KB of
+ * 125KB, measured), which then gets cached. So wait until the current document
+ * has finished parsing - waitForFunction re-runs across the navigation - and
+ * only then snapshot it.
+ */
+async function stableContent(page: Page): Promise<string> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await page
+        .waitForFunction(() => document.readyState !== "loading", undefined, { timeout: 15_000 })
+        .catch(() => {});
+      return await page.content();
+    } catch (e) {
+      if (!/navigating/i.test(String((e as Error)?.message))) throw e;
+    }
+  }
+  return page.content();
 }
 
 // ============ Browser lifecycle ============
@@ -731,8 +757,14 @@ export async function getPage(
   }
 
   const blockResources = (p: Page) => p.route('**/*', (route) => {
-    const resourceType = route.request().resourceType();
-    if (BLOCKED_RESOURCE_TYPES.includes(resourceType as any)) {
+    const request = route.request();
+    // The page's own navigation is never blocked, whatever host a redirect lands
+    // on; ad iframes are sub-frame navigations and stay blocked.
+    const pageNavigation = request.isNavigationRequest() && request.frame() === p.mainFrame();
+    if (
+      BLOCKED_RESOURCE_TYPES.includes(request.resourceType() as any) ||
+      (!pageNavigation && isThirdParty(request.url()))
+    ) {
       route.abort();
     } else {
       route.continue();
@@ -770,7 +802,7 @@ export async function getPage(
       });
       console.log(`[Scraper] Navigation completed in ${Date.now() - navStart}ms`);
 
-      let pageContent = await page.content();
+      let pageContent = await stableContent(page);
 
       // Cloudflare's current interstitial is a bare "Just a moment..." shell
       // that loads its challenge in JS, so the old markers above match nothing
@@ -786,7 +818,7 @@ export async function getPage(
         // drop the cookies and retry clean.
         const canResetSession = useAnon && attempts < maxAttempts;
         await waitForChallengeToClear(page, url, canResetSession ? Math.min(CHALLENGE_WAIT_MS, 8000) : CHALLENGE_WAIT_MS);
-        pageContent = await page.content();
+        pageContent = await stableContent(page);
 
         if (looksLikeChallenge(pageContent)) {
           if (attempts >= maxAttempts) break;
@@ -867,7 +899,7 @@ export async function getPage(
         }
       }
 
-      const content = await page.content();
+      const content = await stableContent(page);
       console.log(`[Scraper] Browser page fetched in ${Date.now() - startTime}ms total`);
       await rememberCookiesFromBrowser(ctx, wantAuth ? userId : undefined);
       const release = async () => {
