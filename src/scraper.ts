@@ -796,7 +796,7 @@ export async function getPage(
       console.log(`[Scraper] Browser fetching ${url} (attempt ${attempts})`);
 
       const navStart = Date.now();
-      await page.goto(url, {
+      const response = await page.goto(url, {
         waitUntil: "domcontentloaded",
         timeout: SCRAPER_TIMEOUT
       });
@@ -889,7 +889,10 @@ export async function getPage(
         );
       }
 
-      if (waitForSelector) {
+      // A 404 (a removed fiction or chapter) will never grow the selector, so waiting
+      // the full timeout for it only made every visit - and every cache-warming run
+      // over a followed fiction that was taken down - cost 20s for nothing.
+      if (waitForSelector && response?.status() !== 404) {
         try {
           const selectorStart = Date.now();
           await page.waitForSelector(waitForSelector, { timeout: SCRAPER_SELECTOR_TIMEOUT });
