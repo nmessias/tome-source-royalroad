@@ -619,8 +619,8 @@ export /**
  * on a cold browser can take a while to run, so the wait is generous and
  * success is also accepted when the URL leaves the challenge host.
  */
-async function waitForChallengeToClear(page: Page, url: string): Promise<boolean> {
-  const deadline = Date.now() + CHALLENGE_WAIT_MS;
+async function waitForChallengeToClear(page: Page, url: string, waitMs: number = CHALLENGE_WAIT_MS): Promise<boolean> {
+  const deadline = Date.now() + waitMs;
   const challengeHost = new URL(url).hostname;
 
   while (Date.now() < deadline) {
@@ -756,6 +756,7 @@ export async function getPage(
 
   try {
     let attempts = 0;
+    let sessionReset = false;
     const maxAttempts = CHALLENGE_ATTEMPTS;
 
     while (attempts < maxAttempts) {
@@ -778,13 +779,27 @@ export async function getPage(
       // a fresh goto would restart it and burn an attempt.
       if (looksLikeChallenge(pageContent)) {
         console.log(`[Scraper] Cloudflare challenge on ${url} (attempt ${attempts}), waiting for it to clear...`);
-        await waitForChallengeToClear(page, url);
+        // The shared anonymous context keeps Cloudflare cookies bound to the exit
+        // IP that earned them. Behind an exit node whose IP moves (a phone hopping
+        // between Wi-Fi and mobile data) Cloudflare then challenges that stale
+        // session for good, so a long first wait is wasted: give it a short one,
+        // drop the cookies and retry clean.
+        const canResetSession = useAnon && attempts < maxAttempts;
+        await waitForChallengeToClear(page, url, canResetSession ? Math.min(CHALLENGE_WAIT_MS, 8000) : CHALLENGE_WAIT_MS);
         pageContent = await page.content();
 
         if (looksLikeChallenge(pageContent)) {
           if (attempts >= maxAttempts) break;
+          if (canResetSession) {
+            await ctx.clearCookies().catch(() => {});
+            sessionReset = true;
+          }
           continue;
         }
+      }
+      if (sessionReset) {
+        console.log(`[Scraper] ${url} cleared after dropping the shared session's cookies - the exit IP most likely changed`);
+        sessionReset = false;
       }
 
       if (looksLikeLoginPage(pageContent, page.url())) {
