@@ -26,6 +26,7 @@ import {
   ENABLE_BROWSER,
   BROWSER_ENGINE,
   BROWSER_HEADLESS,
+  BROWSER_PROXY,
   CHAPTER_CACHE_TTL,
   SEARCH_CACHE_TTL,
   AUTO_LOGIN_COOLDOWN_MS,
@@ -309,7 +310,7 @@ export async function initBrowser(): Promise<void> {
 
   if (browser) return;
 
-  console.log(`Initializing ${BROWSER_ENGINE} browser (headless=${BROWSER_HEADLESS})...`);
+  console.log(`Initializing ${BROWSER_ENGINE} browser (headless=${BROWSER_HEADLESS}, proxy=${BROWSER_PROXY?.server ?? "none"})...`);
   const startTime = Date.now();
 
   try {
@@ -320,6 +321,7 @@ export async function initBrowser(): Promise<void> {
       browser = await chromium.launch({
         channel: "chromium",
         headless: BROWSER_HEADLESS,
+        proxy: BROWSER_PROXY,
         args: [
           // Makes navigator.webdriver false, so the stealth init script is only
           // belt-and-braces.
@@ -332,6 +334,7 @@ export async function initBrowser(): Promise<void> {
       const { firefox } = await import("playwright");
       browser = await firefox.launch({
         headless: true,
+        proxy: BROWSER_PROXY,
         firefoxUserPrefs: {
           "browser.cache.disk.enable": false,
           "browser.cache.memory.enable": true,

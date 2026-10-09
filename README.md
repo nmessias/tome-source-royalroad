@@ -27,6 +27,7 @@ Requires Tome >= 1.5.0.
 | `ENABLE_BROWSER=true` | Use Playwright (Chromium) for scraping (optional, heavier image) |
 | `ROYAL_ROAD_BROWSER` | `chromium` (default) or `firefox`. Chromium logs in reliably; Firefox cannot get past Cloudflare's login check. |
 | `ROYAL_ROAD_HEADLESS` | `true` to run headless. Leave unset in production — Cloudflare rejects the login POST from a headless browser. |
+| `ROYAL_ROAD_PROXY` | Proxy URL for the scraper browser, e.g. `http://user:pass@host:3128` or `socks5://127.0.0.1:1055`. Needed when Cloudflare challenges your server's IP forever (datacenter hosts such as Fly): route out through a residential IP. The exit IP must be stable. |
 | `ROYAL_ROAD_CHAPTER_TTL_DAYS` | Chapter cache lifetime in days (default `7`). |
 | `ROYAL_ROAD_LOGIN_COOLDOWN_MS` | Backoff after a failed automatic login (default 5 min). The Settings > Refresh session button always skips it. |
 

@@ -17,6 +17,30 @@ export const BROWSER_ENGINE = (process.env.ROYAL_ROAD_BROWSER || "chromium") as 
 // pointing DISPLAY at it - see scripts/start.sh in the Tome repo.
 export const BROWSER_HEADLESS = process.env.ROYAL_ROAD_HEADLESS === "true";
 
+// Egress proxy for the scraper browser (ROYAL_ROAD_PROXY), e.g.
+// http://user:pass@host:3128 or socks5://127.0.0.1:1055.
+//
+// Cloudflare judges the IP, not the browser: the same Chromium config clears in
+// ~2s from a home connection and never clears from a datacenter range such as
+// Fly's. Route the browser out through an IP Cloudflare trusts. cf_clearance is
+// bound to the exit IP, so the proxy needs a stable one. Chromium cannot do
+// SOCKS5 with credentials - use an http:// proxy for those.
+export function parseProxy(raw: string): { server: string; username?: string; password?: string } | undefined {
+  if (!raw) return undefined;
+  try {
+    const u = new URL(raw);
+    return {
+      server: `${u.protocol}//${u.host}`,
+      ...(u.username && { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) }),
+    };
+  } catch {
+    // Traffic would silently go out direct and get challenged, so say so loudly.
+    console.error("[Config] ROYAL_ROAD_PROXY is not a valid URL - ignoring it");
+    return undefined;
+  }
+}
+export const BROWSER_PROXY = parseProxy(process.env.ROYAL_ROAD_PROXY || "");
+
 // Royal Road
 export const ROYAL_ROAD_BASE_URL = "https://www.royalroad.com";
 export const ROYAL_ROAD_USERNAME = process.env.ROYAL_ROAD_USERNAME || "";
