@@ -1,7 +1,8 @@
 /**
  * Hybrid HTTP + Playwright scraper for Royal Road
- * Tries fast HTTP fetch first, falls back to a real browser for Cloudflare challenges
- * Browser fallback can be disabled via ENABLE_BROWSER=false to save resources
+ * Tries a Chrome-impersonating HTTP fetch first, falls back to a real browser
+ * for JavaScript challenges. Browser fallback can be disabled via
+ * ENABLE_BROWSER=false to save resources.
  *
  * All HTML parsing lives in ./parsers so it stays pure and testable.
  */
@@ -34,6 +35,7 @@ import {
   AUTO_LOGIN_COOLDOWN_MS,
 } from "./config";
 import { performAutoLogin, ROYAL_ROAD_AUTO_LOGIN_ENABLED } from "./royalroad-auth";
+import { cookieHeaderFor, fetchRoyalRoad } from "./http";
 import {
   FICTION_CARD_WAIT_SELECTOR,
   HISTORY_ROW_SELECTOR,
@@ -58,9 +60,6 @@ import type { Fiction, FollowedFiction, ChapterContent, ToplistType, HistoryEntr
 // src out of the markup, so downloading them just burns the machine's CPU and
 // bandwidth (and it makes Cloudflare challenges slower to settle).
 const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image'] as const;
-
-// HTTP fetch user agent (same as Playwright context)
-const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 // How long to sit on a Cloudflare challenge before giving up on it.
 //
@@ -151,8 +150,8 @@ function setCacheWithStale(key: string, value: string, ttl: number): void {
 }
 
 /**
- * Run a live fetch; when Royal Road cannot be reached - e.g. the phone that serves
- * as the exit node is offline - serve the last good copy instead of an error page.
+ * Run a live fetch; when Royal Road cannot be reached - e.g. the network or an
+ * optional proxy is down - serve the last good copy instead of an error page.
  * Rethrows when there is no such copy or the failure is not a connectivity one.
  */
 async function orStale<T>(key: string, live: () => Promise<T>): Promise<T> {
@@ -192,17 +191,15 @@ async function parallelLimit<T>(
 /**
  * Cookies for an HTTP fetch.
  *
- * Note what is deliberately NOT here: a `cf_clearance`. Plain `fetch` from a
- * server is blocked by Cloudflare on its TLS fingerprint, not on its cookies,
- * so re-sending a stored clearance buys nothing — and a clearance that has
- * gone stale makes Cloudflare treat the request as forged. The browser is the
- * only path that gets through, and it earns its own clearance.
+ * The HTTP client impersonates Chrome, so it can pass Cloudflare on its own;
+ * the stored identity cookie supplies the logged-in session. A `cf_clearance`
+ * is dropped because it is bound to the IP/browser that earned it — a stale one
+ * makes Cloudflare treat the request as forged (the browser path already does
+ * the same).
  */
 function getCookiesForFetch(userId?: string): string {
   if (!userId) return "";
-  return getRoyalRoadCookiesForPlaywright(userId)
-    .map((c: { name: string; value: string }) => `${c.name}=${c.value}`)
-    .join("; ");
+  return cookieHeaderFor(getRoyalRoadCookiesForPlaywright(userId));
 }
 
 /**
@@ -252,18 +249,15 @@ async function tryHttpFetch(
   const startTime = Date.now();
 
   try {
-    const headers: Record<string, string> = {
-      "User-Agent": USER_AGENT,
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.5",
-    };
+    const headers: Record<string, string> = {};
 
-    // Sent for anonymous requests too: the shared Cloudflare clearance is not
-    // user-bound, and skipping it made every public fetch re-challenge.
     const cookieHeader = getCookiesForFetch(userId);
     if (cookieHeader) headers["Cookie"] = cookieHeader;
 
-    const response = await fetch(url, {
+    // impit supplies the browser-consistent User-Agent, Accept and sec-ch-ua
+    // headers for its Chrome profile. Overriding them here would create the
+    // exact fingerprint mismatch the impersonation exists to avoid.
+    const response = await fetchRoyalRoad(url, {
       method: "GET",
       headers,
       redirect: "follow",
@@ -408,8 +402,9 @@ export async function initBrowser(): Promise<void> {
     browser = null;
     console.error(
       `[Scraper] Failed to launch ${BROWSER_ENGINE}: ${(error as Error).message}\n` +
-      `  Cloudflare blocks plain HTTP from datacenter IPs, so without a browser ` +
-      `every page needs one. Chromium must run headful (ROYAL_ROAD_HEADLESS is ` +
+      `  The HTTP path impersonates Chrome; this browser is only needed when ` +
+      `Cloudflare serves a JavaScript challenge or the session has to be renewed ` +
+      `interactively. Chromium must run headful (ROYAL_ROAD_HEADLESS is ` +
       `${BROWSER_HEADLESS ? "true" : "false"}), which in a container means Xvfb ` +
       `with DISPLAY set - scripts/start.sh does this automatically.`
     );
@@ -623,8 +618,7 @@ function assertHasContent(label: string, content: string, probe: RegExp): void {
     throw new Error(
       `Cloudflare blocked the request for ${label}` +
       (title ? ` (page: "${title}")` : "") +
-      `. Cloudflare judges the server's IP, so this is not something the plugin ` +
-      `can work around — retrying will not help.`
+      `. The browser fallback could not clear the challenge either.`
     );
   }
 
@@ -707,15 +701,18 @@ export async function getPage(
   const hasSession = userId ? hasRoyalRoadSession(userId) : false;
 
   if (userId && !hasSession && !allowAnonymous) {
-    // Prefer the browser login: the HTTP login cannot get past Cloudflare.
-    if (ENABLE_BROWSER && ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
+    if (ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
       console.log("[Scraper] No session found, attempting auto-login...");
-      if (!(await performBrowserLogin(userId))) {
-        throw new Error("Auto-login failed. Please configure your Royal Road session manually.");
-      }
-    } else if (ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
+      // The Chrome-impersonating HTTP client can submit the login form without
+      // a JS challenge. Keep the browser as the fallback for when Cloudflare
+      // serves one that only a real browser can solve.
       const loggedIn = await performAutoLogin(userId);
-      if (!loggedIn) {
+      if (!loggedIn && ENABLE_BROWSER) {
+        console.log("[Scraper] HTTP auto-login failed, trying the browser...");
+        if (!(await performBrowserLogin(userId))) {
+          throw new Error("Auto-login failed. Please configure your Royal Road session manually.");
+        }
+      } else if (!loggedIn) {
         throw new Error("Auto-login failed. Please configure your Royal Road session manually.");
       }
     } else {
@@ -724,8 +721,7 @@ export async function getPage(
   }
 
   // With a public page and no usable session, go straight to anonymous: there
-  // is nothing an authenticated fetch would add. The shared Cloudflare
-  // clearance still goes out (see getCookiesForFetch).
+  // is nothing an authenticated fetch would add.
   const wantAuth = !!userId && hasSession && !(allowAnonymous && isSessionKnownDead(userId));
   console.log(`[Scraper] Trying HTTP fetch for ${url} (${wantAuth ? 'auth' : 'anon'})`);
 
@@ -943,8 +939,8 @@ export async function getPage(
 
     throw new Error(
       "Cloudflare would not let the browser through after several attempts. " +
-      "Cloudflare is judging the server's IP address, so waiting longer will not " +
-      "help — this needs a network Cloudflare trusts, not a code change."
+      "The HTTP path already uses Chrome TLS impersonation, so this is either a " +
+      "new challenge type or a network/proxy problem."
     );
   } catch (error) {
     try { await page.close(); } catch {}
@@ -965,11 +961,11 @@ export async function getPage(
  */
 async function resolveRedirectUrl(url: string, userId?: string): Promise<string | null> {
   try {
-    const headers: Record<string, string> = { "User-Agent": USER_AGENT };
+    const headers: Record<string, string> = {};
     const cookieHeader = getCookiesForFetch(userId);
     if (cookieHeader) headers["Cookie"] = cookieHeader;
 
-    const response = await fetch(url, { method: "GET", redirect: "manual", headers });
+    const response = await fetchRoyalRoad(url, { method: "GET", redirect: "manual", headers });
 
     const location = response.headers.get("location");
     if (location) {
@@ -1400,12 +1396,11 @@ export async function setBookmark(
   try {
     console.log(`[Scraper] Setting bookmark: fiction=${fictionId}, type=${type}, mark=${mark}`);
 
-    const response = await fetch(url, {
+    const response = await fetchRoyalRoad(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
         "Cookie": getCookiesForFetch(userId),
-        "User-Agent": USER_AGENT,
       },
       body: formData.toString(),
       redirect: "manual",  // Don't follow redirects automatically

@@ -5,8 +5,7 @@ import {
   ROYAL_ROAD_AUTO_LOGIN_ENABLED,
 } from "./config";
 import { setRoyalRoadCookie } from "./royalroad-credentials";
-
-const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+import { fetchRoyalRoad } from "./http";
 
 export { ROYAL_ROAD_AUTO_LOGIN_ENABLED };
 
@@ -20,11 +19,7 @@ export async function performAutoLogin(userId: string): Promise<boolean> {
 
   try {
     // Step 1: GET login page to extract CSRF token and initial cookies
-    const loginPageRes = await fetch(`${ROYAL_ROAD_BASE_URL}/account/login?returnurl=%2Fhome`, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml",
-      },
+    const loginPageRes = await fetchRoyalRoad(`${ROYAL_ROAD_BASE_URL}/account/login?returnurl=%2Fhome`, {
       redirect: "manual",
     });
 
@@ -43,7 +38,7 @@ export async function performAutoLogin(userId: string): Promise<boolean> {
         loginHtml.includes("challenge-platform") ||
         loginHtml.includes("challenge-running")
       ) {
-        console.error("[AutoLogin] Login page is behind a Cloudflare challenge - plain HTTP cannot get past it");
+        console.error("[AutoLogin] Login page is behind a Cloudflare challenge - falling back to the browser");
         return false;
       }
       if (loginPageRes.status === 302 || loginHtml.includes("window.location") || !loginHtml.includes("Sign In")) {
@@ -74,12 +69,10 @@ export async function performAutoLogin(userId: string): Promise<boolean> {
 
     const cookieHeader = initialCookies.map(c => c.split(";")[0]).join("; ");
 
-    const loginRes = await fetch(`${ROYAL_ROAD_BASE_URL}/account/login?returnurl=%2Fhome`, {
+    const loginRes = await fetchRoyalRoad(`${ROYAL_ROAD_BASE_URL}/account/login?returnurl=%2Fhome`, {
       method: "POST",
       headers: {
-        "User-Agent": USER_AGENT,
         "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "text/html",
         "Referer": `${ROYAL_ROAD_BASE_URL}/account/login?returnurl=%2Fhome`,
         "Cookie": cookieHeader,
       },

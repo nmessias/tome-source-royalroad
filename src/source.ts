@@ -175,13 +175,12 @@ export const royalroadSource: Source = {
   autoLogin: {
     enabled: ROYAL_ROAD_AUTO_LOGIN_ENABLED,
     async refresh(userId) {
-      // Cloudflare blocks the HTTP login from datacenter IPs, so prefer the
-      // browser login whenever the browser fallback is available. `force`
-      // skips the automatic attempt backoff: this is the user pressing the
-      // button, not a background retry storm.
-      const ok = ENABLE_BROWSER
-        ? await performBrowserLogin(userId, { force: true })
-        : await performAutoLogin(userId);
+      // Try the Chrome-impersonating HTTP login first; fall back to the browser
+      // for a JS challenge. `force` skips the automatic attempt backoff: this
+      // is the user pressing the button, not a background retry storm.
+      const ok =
+        (await performAutoLogin(userId)) ||
+        (ENABLE_BROWSER ? await performBrowserLogin(userId, { force: true }) : false);
       if (!ok) return false;
       clearSessionState(userId);
       await createContext(userId);

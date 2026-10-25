@@ -27,11 +27,24 @@ Requires Tome >= 1.5.0.
 | `ENABLE_BROWSER=true` | Use Playwright (Chromium) for scraping (optional, heavier image) |
 | `ROYAL_ROAD_BROWSER` | `chromium` (default) or `firefox`. Chromium logs in reliably; Firefox cannot get past Cloudflare's login check. |
 | `ROYAL_ROAD_HEADLESS` | `true` to run headless. Leave unset in production — Cloudflare rejects the login POST from a headless browser. |
-| `ROYAL_ROAD_PROXY` | Proxy URL for the scraper browser, e.g. `http://user:pass@host:3128` or `socks5://127.0.0.1:1055`. Needed when Cloudflare challenges your server's IP forever (datacenter hosts such as Fly): route out through a residential IP. The exit IP must be stable. |
+| `ROYAL_ROAD_PROXY` | Optional proxy URL used by both the HTTP client and the browser, e.g. `http://user:pass@host:3128` or `socks5://127.0.0.1:1055`. Leave unset for the normal direct path. The exit IP must be stable because `cf_clearance` is IP-bound. |
 | `ROYAL_ROAD_CHAPTER_TTL_DAYS` | Chapter cache lifetime in days (default `7`). |
 | `ROYAL_ROAD_LOGIN_COOLDOWN_MS` | Backoff after a failed automatic login (default 5 min). The Settings > Refresh session button always skips it. |
 
 Session cookies (`.AspNetCore.Identity.Application`, `cf_clearance`) can also be entered in Tome's Settings page — the form renders from this source's `credentialFields`.
+
+### Fetching and Cloudflare
+
+The primary path is [`impit`](https://github.com/apify/impit) with its generic
+`chrome` profile: it reproduces Chrome's TLS and HTTP/2 fingerprint, which is
+what Cloudflare checks on Royal Road's HTML pages. A stored
+`.AspNetCore.Identity.Application` cookie is sent with the request; a stored
+`cf_clearance` is deliberately **not** sent, because it is bound to the IP and
+browser that earned it and a stale one makes the request look forged.
+
+Playwright is the fallback for a JavaScript challenge or an interactive login.
+It is optional (`ENABLE_BROWSER=true` turns it on), and `ROYAL_ROAD_PROXY` is an
+optional escape hatch — neither is required for the direct HTTP path.
 
 ### A note on the two front ends
 

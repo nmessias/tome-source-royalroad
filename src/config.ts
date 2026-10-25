@@ -17,14 +17,14 @@ export const BROWSER_ENGINE = (process.env.ROYAL_ROAD_BROWSER || "chromium") as 
 // pointing DISPLAY at it - see scripts/start.sh in the Tome repo.
 export const BROWSER_HEADLESS = process.env.ROYAL_ROAD_HEADLESS === "true";
 
-// Egress proxy for the scraper browser (ROYAL_ROAD_PROXY), e.g.
+// Egress proxy for the Royal Road scraper (ROYAL_ROAD_PROXY), e.g.
 // http://user:pass@host:3128 or socks5://127.0.0.1:1055.
 //
-// Cloudflare judges the IP, not the browser: the same Chromium config clears in
-// ~2s from a home connection and never clears from a datacenter range such as
-// Fly's. Route the browser out through an IP Cloudflare trusts. cf_clearance is
-// bound to the exit IP, so the proxy needs a stable one. Chromium cannot do
-// SOCKS5 with credentials - use an http:// proxy for those.
+// Optional. The primary HTTP path impersonates Chrome and normally goes direct;
+// this is a manual escape hatch for when a proxy is needed. If set, it is used
+// by both impit and the Playwright fallback. cf_clearance is bound to the exit
+// IP, so the proxy needs a stable one. Chromium cannot do SOCKS5 with
+// credentials - use an http:// proxy for those.
 export function parseProxy(raw: string): { server: string; username?: string; password?: string } | undefined {
   if (!raw) return undefined;
   try {
@@ -44,10 +44,9 @@ export const BROWSER_PROXY = parseProxy(process.env.ROYAL_ROAD_PROXY || "");
 // Only royalroad.com itself and Cloudflare (its challenge loads from
 // challenges.cloudflare.com) need to load in the scraper browser. Every other
 // host on a page is ad and analytics traffic - about 50 of the ~125 requests per
-// page, measured - that does nothing for a scraper but crowd the exit node's
-// link. Blocking it halves the requests and cuts network-idle time from ~6s to
-// ~2s with the parsed content unchanged; over a phone's tunnel the saving is
-// far bigger.
+// page, measured - that does nothing for a scraper but crowd the link. Blocking
+// it halves the requests and cuts network-idle time from ~6s to ~2s with the
+// parsed content unchanged.
 const FIRST_PARTY_HOST = /(^|\.)(royalroad\.com|cloudflare\.com)$/;
 
 /** True for an http(s) request to a host that is neither Royal Road nor Cloudflare. */
