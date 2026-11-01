@@ -155,7 +155,7 @@ export const royalroadSource: Source = {
     // A pasted cookie is assumed good until proven otherwise; drop any stale
     // "known dead" verdict from the previous session.
     clearSessionState(userId);
-    await createContext(userId);
+    await createContext(userId, { force: true });
     const valid = await validateCookies(userId);
     if (valid) {
       triggerCacheWarm().catch(console.error);
@@ -167,7 +167,7 @@ export const royalroadSource: Source = {
     clearRoyalRoadCookies(userId);
     clearSessionState(userId);
     clearCache();
-    await createContext(userId);
+    await createContext(userId, { force: true });
   },
   hasSession(userId) {
     return hasRoyalRoadSession(userId);
@@ -183,7 +183,7 @@ export const royalroadSource: Source = {
         (ENABLE_BROWSER ? await performBrowserLogin(userId, { force: true }) : false);
       if (!ok) return false;
       clearSessionState(userId);
-      await createContext(userId);
+      await createContext(userId, { force: true });
       await validateCookies(userId);
       triggerCacheWarm().catch(console.error);
       return true;

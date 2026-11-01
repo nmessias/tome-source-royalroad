@@ -327,15 +327,30 @@ async function stableContent(page: Page): Promise<string> {
 
 let browser: Browser | null = null;
 let context: BrowserContext | null = null;
+let contextUserId: string | null = null;
 let anonContext: BrowserContext | null = null;
 
 /**
  * Auth contexts currently owned by an in-flight request. `createContext`
- * replaces the shared slot on every call (Settings save, cookie validation,
- * auto-login refresh), and must not close a context a concurrent request is
- * still reading pages from.
+ * replaces the shared slot when credentials change and must not close a context
+ * a concurrent request is still reading pages from. Counted rather than a plain
+ * set because concurrent requests can share the same persistent context.
  */
-const inFlightContexts = new Set<BrowserContext>();
+const inFlightContexts = new Map<BrowserContext, number>();
+
+function retainContext(ctx: BrowserContext): void {
+  inFlightContexts.set(ctx, (inFlightContexts.get(ctx) ?? 0) + 1);
+}
+
+function releaseContext(ctx: BrowserContext): void {
+  const remaining = (inFlightContexts.get(ctx) ?? 0) - 1;
+  if (remaining > 0) inFlightContexts.set(ctx, remaining);
+  else inFlightContexts.delete(ctx);
+}
+
+function isContextInFlight(ctx: BrowserContext): boolean {
+  return inFlightContexts.has(ctx);
+}
 
 async function ensureBrowser(): Promise<void> {
   if (!ENABLE_BROWSER) return;
@@ -346,6 +361,7 @@ async function ensureBrowser(): Promise<void> {
     }
     browser = null;
     context = null;
+    contextUserId = null;
     anonContext = null;
     await initBrowser();
   }
@@ -415,18 +431,30 @@ export async function initBrowser(): Promise<void> {
   console.log("Browser initialized");
 }
 
-export async function createContext(userId: string): Promise<void> {
+export async function createContext(
+  userId: string,
+  opts: { force?: boolean } = {},
+): Promise<BrowserContext | null> {
   if (!ENABLE_BROWSER || !browser) {
     if (ENABLE_BROWSER) await initBrowser();
-    return;
+    return null;
+  }
+
+  // Keep the context (and the Cloudflare clearance it earned) for the same
+  // user. Recreating it on every request forced a fresh JS challenge on every
+  // authenticated page. Credential changes and auto-login pass force=true.
+  if (!opts.force && context && contextUserId === userId) {
+    return context;
   }
 
   // Close the context this slot held previously, but only when no in-flight
   // request still owns it - otherwise a concurrent page load gets torn down
-  // mid-navigation.
-  if (context && !inFlightContexts.has(context)) {
+  // mid-navigation. A replaced in-flight context is closed when its request
+  // releases it (see releaseRequestContext in getPage).
+  if (context && !isContextInFlight(context)) {
     try { await context.close(); } catch {}
   }
+  contextUserId = null;
 
   const cookies = getRoyalRoadCookiesForPlaywright(userId)
     // A cf_clearance from another machine is invalid here and poisons the
@@ -442,6 +470,7 @@ export async function createContext(userId: string): Promise<void> {
     locale: "en-US",
     timezoneId: "America/New_York",
   });
+  contextUserId = userId;
 
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
@@ -455,6 +484,8 @@ export async function createContext(userId: string): Promise<void> {
   } else {
     console.warn("WARNING: No cookies loaded into auth context!");
   }
+
+  return context;
 }
 
 async function createAnonContext(): Promise<void> {
@@ -762,24 +793,40 @@ export async function getPage(
   let ctx: BrowserContext | null = useAnon ? anonContext : context;
 
   if (!useAnon && userId) {
-    await createContext(userId);
-    if (!context) {
+    const authContext = await createContext(userId);
+    if (!authContext) {
       throw new Error("Failed to create authenticated browser context");
     }
-    ctx = context;
+    ctx = authContext;
   }
 
   if (!ctx) {
     throw new Error("No browser context available");
   }
 
-  // This request owns every auth context it creates; close them all when it
-  // returns/throws so concurrent requests never close each other's context.
-  const requestContexts: BrowserContext[] = [];
-  if (!useAnon && ctx) {
-    inFlightContexts.add(ctx);
-    requestContexts.push(ctx);
-  }
+  // This request holds a claim on its context. Shared contexts stay warm (and
+  // keep their Cloudflare clearance); only a context that was replaced while
+  // this request was in flight is closed when the request releases it.
+  let requestContext: BrowserContext | null = null;
+
+  const releaseRequestContext = async () => {
+    if (!requestContext) return;
+    const c = requestContext;
+    requestContext = null;
+    releaseContext(c);
+    if (c !== context && c !== anonContext) {
+      try { await c.close(); } catch {}
+    }
+  };
+
+  const claimContext = async (c: BrowserContext) => {
+    if (requestContext === c) return;
+    await releaseRequestContext();
+    requestContext = c;
+    retainContext(c);
+  };
+
+  await claimContext(ctx);
 
   const blockResources = (p: Page) => p.route('**/*', (route) => {
     const request = route.request();
@@ -802,10 +849,7 @@ export async function getPage(
 
   const closeOwned = async () => {
     releaseSlot();
-    for (const c of requestContexts) {
-      inFlightContexts.delete(c);
-      try { await c.close(); } catch {}
-    }
+    await releaseRequestContext();
   };
 
   let page = await ctx.newPage();
@@ -836,18 +880,18 @@ export async function getPage(
       // a fresh goto would restart it and burn an attempt.
       if (looksLikeChallenge(pageContent)) {
         console.log(`[Scraper] Cloudflare challenge on ${url} (attempt ${attempts}), waiting for it to clear...`);
-        // The shared anonymous context keeps Cloudflare cookies bound to the exit
-        // IP that earned them. Behind an exit node whose IP moves (a phone hopping
-        // between Wi-Fi and mobile data) Cloudflare then challenges that stale
-        // session for good, so a long first wait is wasted: give it a short one,
-        // drop the cookies and retry clean.
-        const canResetSession = useAnon && attempts < maxAttempts;
-        await waitForChallengeToClear(page, url, canResetSession ? Math.min(CHALLENGE_WAIT_MS, 8000) : CHALLENGE_WAIT_MS);
+        // Wait in place: re-navigating restarts the challenge. On the direct
+        // path the shared context keeps the clearance it earns here, which is
+        // what makes every later page fast. Clearing cookies after a short
+        // wait used to throw that clearance away and force a fresh challenge
+        // on every request. Only a configured proxy can move the exit IP
+        // mid-session, so only then is a cookie reset worth trying.
+        await waitForChallengeToClear(page, url, CHALLENGE_WAIT_MS);
         pageContent = await stableContent(page);
 
         if (looksLikeChallenge(pageContent)) {
           if (attempts >= maxAttempts) break;
-          if (canResetSession) {
+          if (useAnon && BROWSER_PROXY) {
             await ctx.clearCookies().catch(() => {});
             sessionReset = true;
           }
@@ -855,7 +899,7 @@ export async function getPage(
         }
       }
       if (sessionReset) {
-        console.log(`[Scraper] ${url} cleared after dropping the shared session's cookies - the exit IP most likely changed`);
+        console.log(`[Scraper] ${url} cleared after resetting the proxy session's cookies`);
         sessionReset = false;
       }
 
@@ -876,8 +920,9 @@ export async function getPage(
               // far better than an error page - just without personal state.
               console.warn(`[Scraper] Could not restore the session; serving ${url} anonymously`);
               useAnon = true;
+              await releaseRequestContext();
               ctx = anonContext;
-              await closeOwned();
+              await claimContext(ctx);
               page = await ctx.newPage();
               await blockResources(page);
               continue;
@@ -887,11 +932,13 @@ export async function getPage(
               "Paste a fresh .AspNetCore.Identity.Application cookie in Settings > Royal Road."
             );
           }
-          await createContext(userId);
-          ctx = context!;
-          await closeOwned();
-          inFlightContexts.add(ctx);
-          requestContexts.push(ctx);
+          const authContext = await createContext(userId, { force: true });
+          if (!authContext) {
+            throw new Error("Failed to recreate authenticated browser context after login");
+          }
+          ctx = authContext;
+          await releaseRequestContext();
+          await claimContext(ctx);
           page = await ctx.newPage();
           await blockResources(page);
           continue;
@@ -899,9 +946,11 @@ export async function getPage(
 
         if (allowAnonymous) {
           console.warn(`[Scraper] Login redirect on a public page - serving ${url} anonymously`);
+          try { await page.close(); } catch {}
           useAnon = true;
+          await releaseRequestContext();
           ctx = anonContext;
-          await closeOwned();
+          await claimContext(ctx);
           page = await ctx.newPage();
           await blockResources(page);
           continue;
@@ -994,6 +1043,7 @@ export async function closeBrowser(): Promise<void> {
   if (context) {
     await context.close();
     context = null;
+    contextUserId = null;
   }
   if (browser) {
     await browser.close();
@@ -1330,7 +1380,7 @@ export async function validateCookies(userId: string): Promise<boolean> {
         const loggedIn = await performAutoLogin(userId);
         if (loggedIn) {
           clearSessionState(userId);
-          await createContext(userId);
+          await createContext(userId, { force: true });
           const { content: retryContent, release: retryRelease } = await getPage(
             `${ROYAL_ROAD_BASE_URL}/my/follows`,
             undefined,
