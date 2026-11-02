@@ -520,6 +520,42 @@ describe("parseCards (redesign card families)", () => {
   });
 });
 
+// Shape of the expanded card on /my/readlater (captured 2026-11-02).
+const EXPANDED_CARD = `
+<div class="fiction-card-expanded" data-rr-expanded-fic-card="">
+  <a href="/fiction/198033/kismet?utm_source=my"><img data-type="cover" src="https://www.royalroadcdn.com/public/covers-large/198033.jpg"></a>
+  <a href="/fiction/198033/kismet?utm_source=my"><h2>Kismet</h2></a>
+  <a href="/fictions/search?tagsAdd=litrpg">LitRPG</a><a href="/fictions/search?tagsAdd=progression">Progression</a>
+  <div><div>4.27 out of 5</div><div class="uppercase">Rating</div></div>
+  <div><div>3,425</div><div class="uppercase">Followers</div></div>
+  <div><div>1,559</div><div class="uppercase">Pages</div></div>
+  <div class="prose"><p>First paragraph.</p><p>Second paragraph.</p></div>
+  <a href="/fiction/198033/read">Read</a>
+</div>`;
+
+describe("parseCards (expanded read-later card)", () => {
+  const [card] = parseCards(`<html><body>${EXPANDED_CARD}</body></html>`);
+
+  test("reads stats from the value before each label", () => {
+    expect(card).toMatchObject({ rating: 4.27, followers: 3425, pageCount: 1559 });
+  });
+
+  test("reads tags and a space-joined description", () => {
+    expect(card.tags).toEqual(["LitRPG", "Progression"]);
+    expect(card.description).toBe("First paragraph. Second paragraph.");
+  });
+
+  test("drops an unrated fiction's rating", () => {
+    const [unrated] = parseCards(EXPANDED_CARD.replace("4.27 out of 5", "Too few ratings"));
+    expect(unrated.rating).toBeUndefined();
+  });
+});
+
+test("the follows card's New Chapters! badge marks it unread", () => {
+  const html = `<div data-rr-expanded-fic-card><a href="/fiction/1/x"><h2>F</h2></a><strong>New Chapters!</strong></div>`;
+  expect(parseCards(html)[0].hasUnread).toBe(true);
+});
+
 describe("parseHistoryPage (history card families)", () => {
   test("parses the .fiction-card-history layout", () => {
     const html = `

@@ -932,8 +932,28 @@ export interface ParsedCard {
   nextChapterResolveUrl?: string;
   /** Read-later cards show a page count instead of full stats. */
   pageCount?: number;
+  /** Expanded (read-later, logged-in list) cards only. */
+  rating?: number;
+  followers?: number;
+  tags?: string[];
   /** Read-later cards carry a description, follows cards do not. */
   description?: string;
+}
+
+/**
+ * Stats on the expanded card. Each value sits right before its label
+ * ("3,425" then "Followers"; "4.27 out of 5" then "Rating"), so read the
+ * label's previous sibling. "Too few ratings" parses to NaN and is dropped.
+ */
+function expandedCardStats(card: Element): { rating?: number; followers?: number; pages?: number } {
+  const stats: { rating?: number; followers?: number; pages?: number } = {};
+  for (const label of card.querySelectorAll("div")) {
+    const name = label.textContent?.trim().toLowerCase();
+    if (name !== "rating" && name !== "followers" && name !== "pages") continue;
+    const value = parseFloat((label.previousElementSibling?.textContent || "").replace(/,/g, ""));
+    if (!isNaN(value)) stats[name] = value;
+  }
+  return stats;
 }
 
 /**
@@ -989,9 +1009,10 @@ export function parseCards(html: string): ParsedCard[] {
       if (authorEl) author = authorEl.textContent?.trim() || "";
 
       // Unread indicator: a red dot badge in the title row, or any danger-coloured badge.
+      // The current follows card says "New Chapters!" in a badge.
       const hasUnread =
         !!card.querySelector("i.fa-circle, .badge-danger, .bg-danger, [data-unread='true'], [data-unread]") ||
-        /unread/i.test(card.innerHTML);
+        /unread|new chapters!/i.test(card.innerHTML);
 
       const coverEl = card.querySelector("img[data-type='cover'], img[src*='covers'], img.thumbnail");
       let coverUrl = coverEl?.getAttribute("src") || undefined;
@@ -1005,7 +1026,17 @@ export function parseCards(html: string): ParsedCard[] {
         const numMatch = (pageCountEl.textContent || "").match(/([\d,]+)/);
         if (numMatch) pageCount = parseInt(numMatch[1].replace(/,/g, ""), 10);
       }
-      const description = card.querySelector(".hidden-content, .description")?.textContent?.trim() || undefined;
+      // The expanded card's description is a .prose block of paragraphs; join
+      // them with spaces, since textContent runs "end.Next" together.
+      const descEl = card.querySelector(".hidden-content, .description, .prose");
+      const paragraphs = descEl ? [...descEl.querySelectorAll("p")].map((p) => p.textContent?.trim()).filter(Boolean) : [];
+      const description = (paragraphs.length ? paragraphs.join(" ") : descEl?.textContent?.trim()) || undefined;
+
+      const { rating, followers, pages } = expandedCardStats(card);
+      pageCount ??= pages;
+      const tags = [...card.querySelectorAll("a[href*='tagsAdd=']")]
+        .map((a) => a.textContent?.trim() || "")
+        .filter(Boolean);
 
       const readButton = findReadButton(card);
       const refs = chapterRefs(card, readButton);
@@ -1057,6 +1088,7 @@ export function parseCards(html: string): ParsedCard[] {
         lastUpdateAgo, lastReadAgo,
         nextChapterResolveUrl,
         pageCount, description,
+        rating, followers, tags: tags.length ? tags : undefined,
       });
     } catch (e) {
       console.error("Error parsing fiction card:", e);

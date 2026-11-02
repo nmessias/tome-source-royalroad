@@ -68,6 +68,11 @@ import type { Fiction, FollowedFiction, ChapterContent, ToplistType, HistoryEntr
 //   blockResources, so an interstitial can still solve itself.
 const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image', 'script'] as const;
 
+// Blocked images are answered with this instead of aborted: an aborted cover
+// fires Royal Road's inline onerror, which swaps src to the "400 x 600"
+// nocover placeholder before the markup is read.
+const BLANK_GIF = Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64");
+
 // How long to sit on a Cloudflare challenge before giving up on it.
 //
 // The budget is bounded by the reverse proxy, not by patience: Fly cuts a
@@ -775,7 +780,8 @@ export async function getPage(
       (BLOCKED_RESOURCE_TYPES.includes(request.resourceType() as any) ||
         (!pageNavigation && isThirdParty(request.url())))
     ) {
-      route.abort();
+      if (request.resourceType() === 'image') route.fulfill({ contentType: 'image/gif', body: BLANK_GIF });
+      else route.abort();
     } else {
       route.continue();
     }
@@ -1156,7 +1162,10 @@ async function getReadLaterLive(userId: string, ttl: number): Promise<Fiction[]>
     url: card.href,
     coverUrl: card.coverUrl,
     description: card.description,
-    stats: card.pageCount ? { pages: card.pageCount } : undefined,
+    tags: card.tags,
+    stats: card.pageCount || card.rating || card.followers
+      ? { pages: card.pageCount, rating: card.rating, followers: card.followers }
+      : undefined,
   }));
 
   if (fictions.length > 0) {
