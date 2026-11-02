@@ -76,10 +76,29 @@ async function warmFollowsCache(): Promise<void> {
     let cachedChapters = 0;
     let skippedChapters = 0;
     
+    // Bound the work per cycle: the first run after a cache clear otherwise
+    // fires 50 fiction fetches plus 50 chapter fetches through one phone, which
+    // is exactly the burst that earns a Cloudflare challenge. Later cycles pick
+    // up where this one stopped.
+    const MAX_FICTION_WARMS_PER_CYCLE = parseInt(
+      process.env.ROYAL_ROAD_FICTION_WARMS_PER_CYCLE || "10",
+      10
+    );
+    let warms = 0;
+
     for (const fiction of follows) {
+      if (warms >= MAX_FICTION_WARMS_PER_CYCLE) {
+        console.log(`[Job] Fiction warm budget for this cycle used (${MAX_FICTION_WARMS_PER_CYCLE}); the rest waits for the next run`);
+        break;
+      }
       try {
-        const fictionCacheKey = `fiction:${fiction.id}`;
+        // Must match the key the scraper writes (fiction:<id>:<user>); a bare
+        // `fiction:<id>` never hits, so every cycle re-fetched all 50 followed
+        // fictions - hundreds of browser requests an hour, which got the exit
+        // node's IP challenged by Cloudflare and kept the single vCPU busy.
+        const fictionCacheKey = `fiction:${fiction.id}:${adminUserId}`;
         if (!isCached(fictionCacheKey)) {
+          warms++;
           const fictionDetails = await getFiction(fiction.id, adminUserId, CACHE_TTL.FICTION);
           if (!fictionDetails?.chapters?.length) continue;
           

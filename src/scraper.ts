@@ -174,6 +174,24 @@ async function orStale<T>(key: string, live: () => Promise<T>): Promise<T> {
 
 // ============ Small helpers ============
 
+/** Run `fn` over `items` with at most `limit` in flight. */
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 /**
  * Persist cookies learned from a browser visit. Royal Road rotates the
  * session cookie on use, so keeping the freshest copy stops the stored
@@ -976,27 +994,68 @@ async function pageIsLoginShell(page: Page): Promise<boolean> {
 }
 
 /**
- * Resolve `/chapter/next/<fictionId>` redirects inside the page, without
- * rendering anything.
+ * Resolve `/chapter/next/<fictionId>` redirects without rendering a page.
  *
  * Each of these is a 302 to the actual next chapter, so all we need is the
- * final URL. Navigating a page per URL meant loading 40-odd full chapter pages
- * every time the follows cache was warmed. An in-page `fetch()` runs on the
- * Royal Road origin with the browser's cookies and network stack (so Cloudflare
- * sees the same client), follows the redirect, and returns the final URL with
- * no DOM, no scripts and no subresources.
+ * target URL. Two cheap transports, in order:
+ *
+ * 1. The context's request client. It shares the browser's cookies and runs
+ *    through Chromium's network stack, and with `maxRedirects: 0` it hands back
+ *    the `Location` header directly - one small request, no body, no DOM.
+ * 2. An in-page `fetch()` on the page that is already open, as a fallback when
+ *    the request client is refused. Also no DOM, no scripts, no subresources.
+ *
+ * Navigating a page per URL - the old behaviour - meant loading 40-odd full
+ * chapter pages every time the follows cache was warmed.
  *
  * Returns a map of requested URL -> final URL. Unresolved URLs are omitted.
  */
+async function resolveRedirects(page: Page, urls: string[]): Promise<Map<string, string>> {
+  if (urls.length === 0) return new Map();
+
+  const out = new Map<string, string>();
+  const failures: string[] = [];
+  await mapLimit(urls, 8, async (url) => {
+    try {
+      const res = await page.context().request.get(url, {
+        maxRedirects: 0,
+        failOnStatusCode: false,
+        timeout: 15_000,
+      });
+      const status = res.status();
+      const location = res.headers()["location"];
+      if (status >= 300 && status < 400 && location) {
+        out.set(url, new URL(location, url).toString());
+      } else {
+        failures.push(`${status} ${url}`);
+      }
+    } catch (e) {
+      failures.push(`throw ${(e as Error).message.slice(0, 60)} ${url}`);
+    }
+  });
+
+  if (out.size > 0) {
+    if (failures.length > 0) {
+      console.warn(`[Scraper] ${failures.length}/${urls.length} next-chapter redirects failed: ${failures.slice(0, 3).join(", ")}`);
+    }
+    return out;
+  }
+
+  console.warn(
+    `[Scraper] Request client resolved 0/${urls.length} next-chapter redirects (${failures.slice(0, 2).join(", ")}); trying in-page fetch`
+  );
+  return resolveRedirectsInPage(page, urls, 4);
+}
 async function resolveRedirectsInPage(
   page: Page,
   urls: string[],
   concurrency: number = 6
 ): Promise<Map<string, string>> {
   if (urls.length === 0) return new Map();
-  const pairs = await page.evaluate(
+  const result = await page.evaluate(
     async ({ urls, concurrency }) => {
       const out: [string, string][] = [];
+      const failed: { url: string; status: number; type: string; finalUrl: string }[] = [];
       let next = 0;
       const worker = async () => {
         while (next < urls.length) {
@@ -1013,21 +1072,28 @@ async function resolveRedirectsInPage(
             // per URL.
             const finalUrl = res.url;
             const ok = res.ok;
+            if (!ok) failed.push({ url, status: res.status, type: res.type, finalUrl });
             res.body?.cancel().catch(() => {});
             if (ok && finalUrl && finalUrl !== url) out.push([url, finalUrl]);
-          } catch {
-            // Leave it unresolved; the caller keeps the read link unset.
+          } catch (e) {
+            failed.push({ url, status: 0, type: "throw", finalUrl: String((e as Error)?.message).slice(0, 80) });
           }
         }
       };
       await Promise.all(
         Array.from({ length: Math.min(concurrency, urls.length) }, worker)
       );
-      return out;
+      return { out, failed };
     },
     { urls, concurrency }
   );
-  return new Map(pairs);
+  if (result.failed.length > 0) {
+    console.warn(
+      `[Scraper] ${result.failed.length}/${urls.length} next-chapter redirects failed in-page. ` +
+      `Sample: ${JSON.stringify(result.failed.slice(0, 3))}`
+    );
+  }
+  return new Map(result.out);
 }
 
 export async function closeBrowser(): Promise<void> {
@@ -1114,8 +1180,8 @@ async function getFollowsLive(userId: string, ttl: number): Promise<FollowedFict
         console.warn(`Cannot resolve ${needing.length} next chapter URLs without a browser page`);
       } else {
         const startTime = Date.now();
-        console.log(`Resolving ${needing.length} next chapter redirect URLs in-page...`);
-        const resolved = await resolveRedirectsInPage(
+        console.log(`Resolving ${needing.length} next chapter redirect URLs...`);
+        const resolved = await resolveRedirects(
           page,
           needing.map((f) => f.__resolveUrl!)
         );
