@@ -29,6 +29,7 @@ import { withStale } from "./stale-cache";
 import { useAuthenticatedContext } from "./context-selection";
 import { FICTION_CONTENT_PROBE, FICTION_READY_SELECTOR } from "./fiction-readiness";
 import { fictionCacheKey as makeFictionCacheKey } from "./fiction-cache-key";
+import { readSavedFiction } from "./fiction-fallback";
 import {
   ROYAL_ROAD_BASE_URL,
   ROYAL_ROAD_USERNAME,
@@ -615,6 +616,7 @@ const CONTENT_PROBE = {
 
 const chapterFlights = new SingleFlight<number, ChapterContent>();
 const fictionFlights = new SingleFlight<string, Fiction | null>();
+const fictionRefreshCooldown = new Map<string, number>();
 const followsFlights = new SingleFlight<string, FollowedFiction[]>();
 const readAheadSetting = Number(process.env.ROYAL_ROAD_READ_AHEAD ?? "3");
 const readAheadDepth = Number.isFinite(readAheadSetting) ? Math.max(0, Math.min(10, Math.floor(readAheadSetting))) : 3;
@@ -1295,12 +1297,26 @@ export function getToplistCached(toplist: ToplistType): Fiction[] | null {
 export function getFictionCached(id: number, userId?: string): Fiction | null {
   const key = fictionCacheKey(id, userId);
   const value = getCache(key) ?? getCache(staleKey(key));
-  if (!value) return null;
+  if (!value) return readSavedFiction(getCache, key, id, userId);
   try { return JSON.parse(value) as Fiction; } catch { return null; }
 }
 
 export function getFiction(id: number, userId?: string, ttl: number = CACHE_TTL.FICTION, background = false): Promise<Fiction | null> {
   const key = fictionCacheKey(id, userId);
+  if (!background && !getCache(key)) {
+    const saved = readSavedFiction(getCache, key, id, userId);
+    if (saved) {
+      // Do not make the reader wait for a network or Cloudflare challenge.
+      // Coalesce refreshes and back off between attempts for this cache key.
+      if ((fictionRefreshCooldown.get(key) ?? 0) <= Date.now()) {
+        fictionRefreshCooldown.set(key, Date.now() + 120_000);
+        if (fictionRefreshCooldown.size > 100) fictionRefreshCooldown.delete(fictionRefreshCooldown.keys().next().value!);
+        void fictionFlights.run(key, () => getFictionLive(id, userId, ttl, true, true))
+          .catch((error) => console.warn(`[Cache] Fiction refresh failed: ${String((error as Error).message).split("\n")[0].slice(0, 90)}`));
+      }
+      return Promise.resolve(saved);
+    }
+  }
   return orStale(key, () => fictionFlights.run(key, () => getFictionLive(id, userId, ttl, background)));
 }
 
