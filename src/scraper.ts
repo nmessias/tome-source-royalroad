@@ -62,11 +62,11 @@ import type { Fiction, FollowedFiction, ChapterContent, ToplistType, HistoryEntr
 // not need:
 // - images/fonts/media: covers are read out of the markup, never downloaded
 // - stylesheets: we parse HTML, so layout is pure cost
-// Scripts are deliberately NOT blocked: Cloudflare's managed challenge needs
-// to run (and blocking it made the interstitial impossible to clear, so every
-// challenge turned into a 60s timeout). The memory savings come from the
-// renderer cap below, not from dropping scripts.
-const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image'] as const;
+// - scripts: Royal Road renders chapter and list pages server-side. Running the
+//   site's JS (analytics, ads, live widgets) only burns the single vCPU that the
+//   next navigation needs. Cloudflare's own challenge assets are exempt in
+//   blockResources, so an interstitial can still solve itself.
+const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image', 'script'] as const;
 
 // How long to sit on a Cloudflare challenge before giving up on it.
 //
@@ -75,7 +75,7 @@ const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image']
 // failing is worse than one that fails in thirty. Two attempts at 20s, plus
 // navigation, keeps the worst case near a minute.
 const CHALLENGE_WAIT_MS = parseInt(process.env.ROYAL_ROAD_CHALLENGE_WAIT_MS || String(20 * 1000), 10);
-const CHALLENGE_ATTEMPTS = 2;
+const CHALLENGE_ATTEMPTS = 3;
 
 /**
  * Caps how many browser fetches run at the same time.
@@ -830,7 +830,10 @@ export async function getPage(
         if (secondLook.challenged) {
           console.log(`[Scraper] Challenge still there after ${CHALLENGE_WAIT_MS}ms (${secondLook.reason})`);
           if (attempts >= maxAttempts) break;
-          if (useAnon && BROWSER_PROXY) {
+          // A stale cf_clearance (bound to a previous exit IP) is the usual
+          // reason a challenge refuses to clear. Drop it and retry; the session
+          // cookie goes with it, but the login-recovery path below restores it.
+          if (BROWSER_PROXY) {
             await ctx.clearCookies().catch(() => {});
             sessionReset = true;
           }
