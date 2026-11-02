@@ -24,6 +24,7 @@ import {
 import { deleteCacheByPrefix } from "./cache";
 import { SingleFlight } from "./single-flight";
 import { PrioritySemaphore } from "./priority-semaphore";
+import { IdleLease } from "./idle-lease";
 import { ReadAheadQueue } from "./read-ahead";
 import { withStale } from "./stale-cache";
 import { useAuthenticatedContext } from "./context-selection";
@@ -88,7 +89,7 @@ const BLANK_GIF = Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAA
 // failing is worse than one that fails in thirty. Two attempts at 20s, plus
 // navigation, keeps the worst case near a minute.
 const CHALLENGE_WAIT_MS = parseInt(process.env.ROYAL_ROAD_CHALLENGE_WAIT_MS || String(20 * 1000), 10);
-const CHALLENGE_ATTEMPTS = 3;
+const CHALLENGE_ATTEMPTS = 2;
 
 /**
  * Caps how many browser fetches run at the same time.
@@ -105,6 +106,27 @@ const MAX_CONCURRENT_BROWSER_FETCHES = parseInt(
 );
 
 const browserSlots = new PrioritySemaphore(MAX_CONCURRENT_BROWSER_FETCHES);
+
+/**
+ * Close Chromium after this long without a page in use; the next request
+ * relaunches it. Idle, it holds ~220MB of a 512MB machine, and at its peak it
+ * plus Bun parsing a page exceed the machine: measured on Fly, memory pressure
+ * then stalls everything (tailscaled froze for 24s) and Cloudflare challenges
+ * cannot finish. Read-ahead fills the cache while a chapter is open, so the
+ * browser is mostly idle while the reader reads. 0 keeps it running.
+ */
+const BROWSER_IDLE_MS = parseInt(process.env.ROYAL_ROAD_BROWSER_IDLE_MS || String(5 * 60 * 1000), 10);
+
+const browserLease = new IdleLease(BROWSER_IDLE_MS, () => {
+  console.log(`[Scraper] Browser idle for ${BROWSER_IDLE_MS / 1000}s, closing it to free memory`);
+  closeBrowser().catch((e) => console.warn("[Scraper] Idle browser close failed:", (e as Error).message));
+});
+
+/** Keep the browser open (against the idle close) for the duration of `fn`. */
+async function leased<T>(fn: () => Promise<T>): Promise<T> {
+  const release = browserLease.acquire();
+  try { return await fn(); } finally { release(); }
+}
 
 // ============ Cache keys ============
 
@@ -469,7 +491,11 @@ let lastBrowserLoginAttempt = 0;
 // on every login redirect therefore makes things worse, so background attempts
 // back off. An explicit user action (Settings > Refresh session) passes
 // `force` and skips the backoff entirely.
-export async function performBrowserLogin(userId: string, opts: { force?: boolean } = {}): Promise<boolean> {
+export function performBrowserLogin(userId: string, opts: { force?: boolean } = {}): Promise<boolean> {
+  return leased(() => browserLogin(userId, opts));
+}
+
+async function browserLogin(userId: string, opts: { force?: boolean }): Promise<boolean> {
   if (!ENABLE_BROWSER) {
     console.warn("[AutoLogin] Browser login needs ENABLE_BROWSER=true");
     return false;
@@ -745,12 +771,31 @@ async function waitForChallengeToClear(page: Page, url: string, waitMs: number =
   return false;
 }
 
+type PageResult = { page: Page | null; content: string; authenticated: boolean; release: () => Promise<void> };
+
+/** The browser stays open from the call until the caller's `release()`. */
 export async function getPage(
   url: string,
   waitForSelector?: string,
   userId?: string,
   opts: GetPageOptions = {}
-): Promise<{ page: Page | null; content: string; authenticated: boolean; release: () => Promise<void> }> {
+): Promise<PageResult> {
+  const releaseLease = browserLease.acquire();
+  try {
+    const result = await getPageLeased(url, waitForSelector, userId, opts);
+    return { ...result, release: async () => { try { await result.release(); } finally { releaseLease(); } } };
+  } catch (error) {
+    releaseLease();
+    throw error;
+  }
+}
+
+async function getPageLeased(
+  url: string,
+  waitForSelector: string | undefined,
+  userId: string | undefined,
+  opts: GetPageOptions
+): Promise<PageResult> {
   const startTime = Date.now();
   const allowAnonymous = opts.allowAnonymous === true;
   let hasSession = userId ? hasRoyalRoadSession(userId) : false;
@@ -912,10 +957,12 @@ export async function getPage(
           console.log(`[Scraper] Challenge still there after ${CHALLENGE_WAIT_MS}ms (${secondLook.reason})`);
           if (attempts >= maxAttempts) break;
           // A stale cf_clearance (bound to a previous exit IP) is the usual
-          // reason a challenge refuses to clear. Drop it and retry; the session
-          // cookie goes with it, but the login-recovery path below restores it.
+          // reason a challenge refuses to clear. Drop Cloudflare's cookies and
+          // retry, but only those: clearing everything also dropped the login,
+          // and a logged-out chapter page passes every check here, so progress
+          // syncs then silently ran anonymously.
           if (BROWSER_PROXY) {
-            await ctx.clearCookies().catch(() => {});
+            await ctx.clearCookies({ name: /^(cf_clearance|__cf_bm|_cfuvid)$/ }).catch(() => {});
             sessionReset = true;
           }
           continue;
@@ -1529,6 +1576,7 @@ export async function setBookmark(
   csrfToken: string
 ): Promise<{ success: boolean; error?: string }> {
   const url = `${ROYAL_ROAD_BASE_URL}/fictions/setbookmark/${fictionId}`;
+  const releaseLease = browserLease.acquire();
 
   try {
     console.log(`[Scraper] Setting bookmark: fiction=${fictionId}, type=${type}, mark=${mark}`);
@@ -1536,6 +1584,8 @@ export async function setBookmark(
     // The context's request client shares the browser's cookie jar, so this POST
     // carries the same session (and network path) as a page visit. A plain
     // server-side fetch cannot: Cloudflare blocks non-browser clients outright.
+    // The browser may have been closed while idle.
+    await ensureBrowser();
     const ctx = await createContext(userId);
     if (!ctx) throw new Error("No browser context available for bookmark");
 
@@ -1578,5 +1628,7 @@ export async function setBookmark(
   } catch (error) {
     console.error(`[Scraper] Bookmark error:`, error);
     return { success: false, error: "Network error" };
+  } finally {
+    releaseLease();
   }
 }

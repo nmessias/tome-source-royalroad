@@ -12,15 +12,13 @@ import { ENABLE_BROWSER } from "./config";
 import { royalroadSource as source } from "./source";
 import { startJobs, stopJobs } from "./jobs";
 import { migrateRoyalRoad } from "./migrations";
-import { initBrowser, closeBrowser } from "./scraper";
+import { closeBrowser } from "./scraper";
 
 const feature: Feature = {
   name: "royalroad",
   migrations: migrateRoyalRoad,
   start() {
-    if (ENABLE_BROWSER) {
-      initBrowser().catch(console.error);
-    }
+    // The browser launches on first use and closes when idle (see getPage).
     startJobs();
   },
   async stop() {
