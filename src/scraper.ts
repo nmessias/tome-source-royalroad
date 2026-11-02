@@ -62,11 +62,11 @@ import type { Fiction, FollowedFiction, ChapterContent, ToplistType, HistoryEntr
 // not need:
 // - images/fonts/media: covers are read out of the markup, never downloaded
 // - stylesheets: we parse HTML, so layout is pure cost
-// - scripts: Royal Road renders chapter and list pages server-side. Running the
-//   site's JS (analytics, ads, live widgets) only burns the single vCPU that the
-//   next navigation needs. Cloudflare's own challenge assets are exempt in
-//   blockResources, so an interstitial can still solve itself.
-const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image', 'script'] as const;
+// Scripts are deliberately NOT blocked: Cloudflare's managed challenge needs
+// to run (and blocking it made the interstitial impossible to clear, so every
+// challenge turned into a 60s timeout). The memory savings come from the
+// renderer cap below, not from dropping scripts.
+const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image'] as const;
 
 // How long to sit on a Cloudflare challenge before giving up on it.
 //
