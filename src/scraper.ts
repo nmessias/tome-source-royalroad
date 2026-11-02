@@ -769,7 +769,7 @@ export async function getPage(
     // A Cloudflare challenge needs its own scripts and XHRs. Blocking those
     // made the interstitial impossible to clear, so every challenge turned
     // into a full retry loop.
-    const challengeAsset = /challenges\.cloudflare\.com|cdn-cgi\/challenge-platform/.test(request.url());
+    const challengeAsset = /cloudflare|turnstile|cdn-cgi/.test(request.url());
     if (
       !challengeAsset &&
       (BLOCKED_RESOURCE_TYPES.includes(request.resourceType() as any) ||
