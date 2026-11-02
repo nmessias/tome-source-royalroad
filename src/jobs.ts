@@ -71,7 +71,7 @@ async function warmFollowsCache(): Promise<void> {
       return;
     }
     
-    const follows = await getFollows(adminUserId);
+    const follows = await getFollows(adminUserId, CACHE_TTL.FOLLOWS, true);
     console.log(`[Job] Got ${follows.length} followed fictions`);
     
     let cachedChapters = 0;
@@ -96,7 +96,7 @@ async function warmFollowsCache(): Promise<void> {
         // Share the scraper's key selection so cached pages are not re-fetched.
         if (!isFictionCached(fiction.id, adminUserId)) {
           warms++;
-          const fictionDetails = await getFiction(fiction.id, adminUserId, CACHE_TTL.FICTION);
+          const fictionDetails = await getFiction(fiction.id, adminUserId, CACHE_TTL.FICTION, true);
           if (!fictionDetails?.chapters?.length) continue;
           
           let nextChapterId: number | undefined;
@@ -158,7 +158,7 @@ async function warmToplistsCache(): Promise<void> {
           skipped++;
           console.log(`[Job] Toplist already cached: ${toplist.name}`);
         } else {
-          await getToplist(toplist, undefined, CACHE_TTL.TOPLIST);
+          await getToplist(toplist, undefined, CACHE_TTL.TOPLIST, true);
           cached++;
           console.log(`[Job] Cached toplist: ${toplist.name}`);
           await new Promise(r => setTimeout(r, 2000));

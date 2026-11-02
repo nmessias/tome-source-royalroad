@@ -1150,11 +1150,11 @@ function toFollowedFiction(card: ParsedCard): FollowedFictionWithRecency {
   };
 }
 
-export function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS): Promise<FollowedFiction[]> {
-  return orStale(`follows:${userId}`, () => followsFlights.run(userId, () => getFollowsLive(userId, ttl)));
+export function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS, background = false): Promise<FollowedFiction[]> {
+  return orStale(`follows:${userId}`, () => followsFlights.run(userId, () => getFollowsLive(userId, ttl, background)));
 }
 
-async function getFollowsLive(userId: string, ttl: number): Promise<FollowedFiction[]> {
+async function getFollowsLive(userId: string, ttl: number, background: boolean): Promise<FollowedFiction[]> {
   const cacheKey = `follows:${userId}`;
   const cached = getCache(cacheKey);
   if (cached) {
@@ -1166,6 +1166,7 @@ async function getFollowsLive(userId: string, ttl: number): Promise<FollowedFict
     `${ROYAL_ROAD_BASE_URL}/my/follows`,
     FICTION_CARD_WAIT_SELECTOR,
     userId,
+    { background },
   );
 
   try {
@@ -1256,11 +1257,11 @@ async function getReadLaterLive(userId: string, ttl: number): Promise<Fiction[]>
   return fictions;
 }
 
-export function getToplist(toplist: ToplistType, userId?: string, ttl: number = CACHE_TTL.TOPLIST): Promise<Fiction[]> {
-  return orStale(`toplist:${toplist.slug}`, () => getToplistLive(toplist, userId, ttl));
+export function getToplist(toplist: ToplistType, userId?: string, ttl: number = CACHE_TTL.TOPLIST, background = false): Promise<Fiction[]> {
+  return orStale(`toplist:${toplist.slug}`, () => getToplistLive(toplist, userId, ttl, background));
 }
 
-async function getToplistLive(toplist: ToplistType, userId: string | undefined, ttl: number): Promise<Fiction[]> {
+async function getToplistLive(toplist: ToplistType, userId: string | undefined, ttl: number, background: boolean): Promise<Fiction[]> {
   const cacheKey = `toplist:${toplist.slug}`;
   const cached = getCache(cacheKey);
   if (cached) {
@@ -1268,7 +1269,7 @@ async function getToplistLive(toplist: ToplistType, userId: string | undefined, 
     return JSON.parse(cached);
   }
 
-  const { content, release } = await getPage(toplist.url, ".fiction-list", userId);
+  const { content, release } = await getPage(toplist.url, ".fiction-list", userId, { background });
   await release();
 
   assertHasContent("the fiction list", content, CONTENT_PROBE.list);
@@ -1298,9 +1299,9 @@ export function getFictionCached(id: number, userId?: string): Fiction | null {
   try { return JSON.parse(value) as Fiction; } catch { return null; }
 }
 
-export function getFiction(id: number, userId?: string, ttl: number = CACHE_TTL.FICTION): Promise<Fiction | null> {
+export function getFiction(id: number, userId?: string, ttl: number = CACHE_TTL.FICTION, background = false): Promise<Fiction | null> {
   const key = fictionCacheKey(id, userId);
-  return orStale(key, () => fictionFlights.run(key, () => getFictionLive(id, userId, ttl)));
+  return orStale(key, () => fictionFlights.run(key, () => getFictionLive(id, userId, ttl, background)));
 }
 
 async function getFictionLive(id: number, userId: string | undefined, ttl: number, background = false, force = false, signal?: AbortSignal): Promise<Fiction | null> {
