@@ -605,8 +605,8 @@ export interface ParsedFiction {
 export function parseFictionPage(html: string, id: number, url: string): ParsedFiction {
   const { document } = parseHTML(html);
 
-  // Title
-  const titleEl = document.querySelector(".fic-title h1, h1.font-white");
+  // Title. The logged-in redesign has a single unclassed-for-us h1.
+  const titleEl = document.querySelector(".fic-title h1, h1.font-white") || document.querySelector("h1");
 
   // Author
   let author = "Unknown";
@@ -614,13 +614,28 @@ export function parseFictionPage(html: string, id: number, url: string): ParsedF
   if (authorEl) {
     author = authorEl.textContent?.trim() || "Unknown";
   } else {
-    const headerProfileLink = document.querySelector(".fic-header a[href*='/profile/']");
+    const headerProfileLink =
+      document.querySelector(".fic-header a[href*='/profile/']") ||
+      // Redesign: the first named profile link that is not the account menu.
+      [...document.querySelectorAll("a[href*='/profile/']")].find((a) => {
+        const text = a.textContent?.trim() || "";
+        return text && text !== "My Profile";
+      });
     if (headerProfileLink) {
       author = headerProfileLink.textContent?.trim() || "Unknown";
     }
   }
 
-  const descEl = document.querySelector(".description, .fiction-description");
+  // Redesign: the description is the first show-more block, as paragraphs.
+  const legacyDescEl = document.querySelector(".description, .fiction-description");
+  const showMoreEl = legacyDescEl ? null : document.querySelector("[data-rr-show-more-content]");
+  const description = legacyDescEl?.textContent?.trim() ||
+    (showMoreEl
+      ? [...showMoreEl.querySelectorAll("p")].map((p) => p.textContent?.trim()).filter(Boolean).join("\n\n") ||
+        showMoreEl.textContent?.trim()
+      : undefined);
+  const tags = [...new Set([...document.querySelectorAll("a[href*='tagsAdd=']")].map((a) => a.textContent?.trim() || ""))]
+    .filter(Boolean);
 
   const coverEl = document.querySelector(".fic-header img[src*='covers'], .cover-art-container img, img.cover-art, .thumbnail img");
   let coverUrl = coverEl?.getAttribute("src") || undefined;
@@ -701,9 +716,37 @@ export function parseFictionPage(html: string, id: number, url: string): ParsedF
         nextStatType = "";
       }
     }
-  } else {
+  } else if (document.querySelector(".star[data-content], [data-original-title*='Score']")) {
     const ratingEl = document.querySelector(".star[data-content], [data-original-title*='Score']");
     rating = ratingEl ? parseFloat(ratingEl.getAttribute("data-content") || "0") : undefined;
+  } else {
+    // Redesign: labelled leaves. Scores are a heading followed by a widget
+    // whose aria-label reads "4.5 out of 5 stars" (the review form's widgets
+    // read "Rate this item..." and never match); counts sit before their label
+    // ("4,599" then "Followers"); pages are a sentence after the "Pages" label.
+    const leaves = [...document.querySelectorAll("h3, div, span, dt")].filter((e) => e.children.length === 0);
+    const num = (text: string | null | undefined) => {
+      const m = (text || "").match(/([\d,]+(?:\.\d+)?)/);
+      return m ? parseFloat(m[1].replace(/,/g, "")) : undefined;
+    };
+    const score = (label: Element) => {
+      const m = (label.nextElementSibling?.getAttribute("aria-label") || "").match(/([\d.]+) out of 5/);
+      return m ? parseFloat(m[1]) : undefined;
+    };
+    for (const label of leaves) {
+      const text = label.textContent?.trim();
+      if (text === "Overall Score") rating ??= score(label);
+      else if (text === "Style Score") styleScore ??= score(label);
+      else if (text === "Story Score") storyScore ??= score(label);
+      else if (text === "Grammar Score") grammarScore ??= score(label);
+      else if (text === "Character Score") characterScore ??= score(label);
+      else if (text === "Total Views") views ??= num(label.previousElementSibling?.textContent);
+      else if (text === "Average Views") averageViews ??= num(label.previousElementSibling?.textContent);
+      else if (text === "Followers") followers ??= num(label.previousElementSibling?.textContent);
+      else if (text === "Favorites") favorites ??= num(label.previousElementSibling?.textContent);
+      else if (text === "Ratings") ratings ??= num(label.previousElementSibling?.textContent);
+      else if (text === "Pages") pages ??= num(label.nextElementSibling?.textContent);
+    }
   }
 
   // ---- chapters ----
@@ -748,12 +791,12 @@ export function parseFictionPage(html: string, id: number, url: string): ParsedF
     }
   }
 
-  const followButton = document.querySelector("#follow-button");
-  const favoriteButton = document.querySelector("#favorite-button");
-  const rilButton = document.querySelector("#ril-button");
-  const isFollowing = followButton?.classList?.contains("active") || false;
-  const isFavorite = favoriteButton?.classList?.contains("active") || false;
-  const isReadLater = rilButton?.classList?.contains("active") || false;
+  // Legacy ids, then the redesign's #bookmark-* reactive buttons.
+  const isActive = (el: Element | null) =>
+    !!el && (el.classList.contains("active") || el.getAttribute("data-rr-reactive-button-active") === "true");
+  const isFollowing = isActive(document.querySelector("#follow-button, #bookmark-follow"));
+  const isFavorite = isActive(document.querySelector("#favorite-button, #bookmark-favorite"));
+  const isReadLater = isActive(document.querySelector("#ril-button, #bookmark-ril"));
 
   const csrfInput = document.querySelector('input[name="__RequestVerificationToken"]');
   const csrfToken = csrfInput?.getAttribute("value") || undefined;
@@ -764,7 +807,8 @@ export function parseFictionPage(html: string, id: number, url: string): ParsedF
     author,
     url,
     coverUrl,
-    description: descEl?.textContent?.trim(),
+    description,
+    tags: tags.length ? tags : undefined,
     stats: {
       rating, styleScore, storyScore, grammarScore, characterScore,
       views, averageViews, followers, favorites, ratings, pages,

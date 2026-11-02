@@ -562,6 +562,39 @@ test("the follows card's New Chapters! badge marks it unread", () => {
   expect(parseCards(html)[0].hasUnread).toBe(true);
 });
 
+// Shape of the logged-in fiction page (captured 2026-11-02).
+describe("parseFictionPage (logged-in redesign)", () => {
+  const html = `<html><body>
+    <a href="/profile/1">My Profile</a>
+    <h1 class="text-lg">Imma be a speedster</h1>
+    <a href="/profile/167133">UnproperMadman</a>
+    <a href="/fictions/search?tagsAdd=litrpg">LitRPG</a><a href="/fictions/search?tagsAdd=comedy">Comedy</a>
+    <div data-rr-show-more-content=""><p>First.</p><p>Second.</p></div>
+    <div><div>1,283,954</div><div>Total Views</div></div>
+    <div><div>4,599</div><div>Followers</div></div>
+    <div><div>Pages</div><div>This story would be 1,130 pages long as a book.</div></div>
+    <div><h3>Overall Score</h3><div aria-label="4.5 out of 5 stars"></div></div>
+    <div><h3>Style Score</h3><div aria-label="Rate this item from 0.5 to 5 stars"></div></div>
+    <form><input name="__RequestVerificationToken" value="t"><button id="bookmark-follow" class="h-14 active"></button></form>
+    <button id="bookmark-favorite" data-rr-reactive-button-active="false"></button>
+  </body></html>`;
+  const { fiction } = parseFictionPage(html, 136335, "u");
+
+  test("reads title, author, description and tags", () => {
+    expect(fiction).toMatchObject({ title: "Imma be a speedster", author: "UnproperMadman", description: "First.\n\nSecond." });
+    expect(fiction.tags).toEqual(["LitRPG", "Comedy"]);
+  });
+
+  test("reads stats from labels, skipping the review form's widgets", () => {
+    expect(fiction.stats).toMatchObject({ rating: 4.5, views: 1283954, followers: 4599, pages: 1130 });
+    expect(fiction.stats?.styleScore).toBeUndefined();
+  });
+
+  test("reads bookmark state from the reactive buttons", () => {
+    expect(fiction).toMatchObject({ isFollowing: true, isFavorite: false });
+  });
+});
+
 describe("parseHistoryPage (history card families)", () => {
   test("parses the .fiction-card-history layout", () => {
     const html = `
