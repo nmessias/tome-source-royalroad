@@ -22,7 +22,11 @@ import {
   createContext,
   searchFictions,
   setBookmark,
+  saveUnreadChapters,
+  offlineStatus,
+  queueProgress,
 } from "./scraper";
+import { isOffline } from "./offline";
 import {
   hasRoyalRoadSession,
   setRoyalRoadCookie,
@@ -132,9 +136,16 @@ export const royalroadSource: Source = {
       ? (body as { readAheadDepth?: number }).readAheadDepth : undefined;
     if (fictionId !== null) scheduleReadAhead(fictionId, id, userId, depth);
     // Bypass the shared content cache for the authenticated visit.
-    await progressFlights.run(userId + ":" + id, async () => {
-      await getChapter(id, userId, undefined, { forceLive: true });
-    });
+    try {
+      await progressFlights.run(userId + ":" + id, async () => {
+        await getChapter(id, userId, undefined, { forceLive: true });
+      });
+    } catch (error) {
+      // Unreachable or challenged: send it later rather than lose the place.
+      if (fictionId === null) throw error;
+      queueProgress(userId, fictionId, id);
+      console.warn(`[Progress] Queued chapter ${id}: ${String((error as Error).message).split("\n")[0].slice(0, 90)}`);
+    }
   },
 
   // ---- credentials ----
@@ -209,4 +220,13 @@ Object.assign(royalroadSource, {
     const id = parseId(ref);
     return id === null ? null : getFictionCached(id, userId);
   },
+  async saveForOffline(userId: string, ref: string) {
+    const id = parseId(ref);
+    return id === null ? 0 : saveUnreadChapters(id, userId);
+  },
+  offlineStatus(userId: string, ref: string) {
+    const id = parseId(ref);
+    return id === null ? null : offlineStatus(id, userId);
+  },
+  isOffline,
 });

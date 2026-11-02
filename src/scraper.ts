@@ -21,7 +21,8 @@ import {
   isSessionKnownDead,
   clearSessionState,
 } from "./royalroad-credentials";
-import { deleteCacheByPrefix } from "./cache";
+import { deleteCacheByPrefix, extendCache, savedChapterIds, getCacheByPrefix } from "./cache";
+import { SaveQueue, assertOnline, isOffline, noteUnreachable, onBackOnline, parseSyndicationChapterIds, unreadFrom } from "./offline";
 import { SingleFlight } from "./single-flight";
 import { PrioritySemaphore } from "./priority-semaphore";
 import { IdleLease } from "./idle-lease";
@@ -831,6 +832,7 @@ const SESSION_COOKIE = /^\.AspNetCore\./;
 async function getPageHttp(url: string, userId: string | undefined, opts: GetPageOptions): Promise<PageResult | null> {
   const startTime = Date.now();
   const allowAnonymous = opts.allowAnonymous === true;
+  assertOnline(url);
 
   if (userId && !hasRoyalRoadSession(userId) && !allowAnonymous) {
     if (!ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
@@ -852,6 +854,7 @@ async function getPageHttp(url: string, userId: string | undefined, opts: GetPag
     res = await fetchRoyalRoad(url, wantAuth ? { headers: { Cookie: cookieHeaderFor(getRoyalRoadCookies(userId!)) } } : undefined);
     html = await res.text();
   } catch (error) {
+    if (isUnreachable(error)) noteUnreachable(() => fetchRoyalRoad(`${ROYAL_ROAD_BASE_URL}/cdn-cgi/trace`));
     if (!ENABLE_BROWSER) throw error;
     console.warn(`[Scraper] HTTP fetch of ${url} failed (${(error as Error).name}), trying the browser`);
     return null;
@@ -1609,6 +1612,114 @@ async function loadChapter(
 
   return result;
 }
+
+// ============ Offline reading ============
+
+/** Saved chapters outlast the normal chapter TTL by far: they are kept to be read. */
+const SAVED_CHAPTER_TTL = 365 * 24 * 60 * 60;
+const SAVE_LIMIT = 500;
+const AUTO_SAVE_COUNT = 3;
+const savePace = parseInt(process.env.ROYAL_ROAD_SAVE_PACE_MS || "12000", 10);
+const saveQueue = new SaveQueue({
+  cached: (id) => isCached(`chapter:${id}`),
+  fetch: (id) => getChapter(id, undefined, SAVED_CHAPTER_TTL),
+  offline: isOffline,
+  paceMs: Number.isFinite(savePace) ? savePace : 12000,
+});
+
+/** Keep the chapters already cached for a year and queue the rest. */
+function saveChapters(fictionId: number, ids: number[]): number {
+  extendCache(ids.map((id) => `chapter:${id}`), SAVED_CHAPTER_TTL);
+  return saveQueue.add(fictionId, ids);
+}
+
+/** Save a fiction's unread chapters, up to 500, from the first unread one on. */
+export async function saveUnreadChapters(fictionId: number, userId: string): Promise<number> {
+  const fiction = await getFiction(fictionId, userId);
+  const chapters = fiction?.chapters ?? [];
+  const from = unreadFrom(chapters, fiction?.continueChapterId);
+  return saveChapters(fictionId, chapters.slice(from, from + SAVE_LIMIT).map((c) => c.id));
+}
+
+export function offlineStatus(fictionId: number, userId?: string) {
+  const fiction = getFictionCached(fictionId, userId);
+  const chapters = fiction?.chapters ?? [];
+  if (!chapters.length) return null;
+  const saved = savedChapterIds(chapters.map((c) => c.id));
+  const unread = chapters.slice(unreadFrom(chapters, fiction!.continueChapterId));
+  return {
+    unread: unread.length,
+    saved: unread.filter((c) => saved.has(c.id)).length,
+    pending: saveQueue.pending(fictionId),
+    savedRefs: [...saved].map(String),
+  };
+}
+
+/** Chapter ids from the RSS feed, which Cloudflare does not challenge even from Fly. */
+async function fetchSyndication(fictionId: number): Promise<number[]> {
+  try {
+    const res = await fetch(`${ROYAL_ROAD_BASE_URL}/fiction/syndication/${fictionId}`, { signal: AbortSignal.timeout(20_000) });
+    return res.ok ? parseSyndicationChapterIds(await res.text()) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Save the next few chapters of every follow with something left to read. */
+export async function autoSaveFollows(userId: string, follows: FollowedFiction[]): Promise<void> {
+  for (const follow of follows) {
+    const last = follow.lastReadChapterId;
+    if (!last || follow.latestChapterId === last) continue;
+    let order = (getFictionCached(follow.id, userId)?.chapters ?? []).map((c) => c.id);
+    let at = order.indexOf(last);
+    // Caught up on a cached list that predates the new release: the feed has
+    // the latest ten. A list without the last-read chapter waits for the
+    // fiction warm instead of guessing.
+    if (at >= 0 && order.length - at - 1 < AUTO_SAVE_COUNT) {
+      const known = new Set(order);
+      order = [...order, ...(await fetchSyndication(follow.id)).filter((id) => !known.has(id))];
+    }
+    if (at >= 0) saveChapters(follow.id, order.slice(at + 1, at + 1 + AUTO_SAVE_COUNT));
+  }
+}
+
+const PENDING_PROGRESS = "progress-pending:";
+
+/** The latest chapter read per fiction while Royal Road could not record it. */
+export function queueProgress(userId: string, fictionId: number, chapterId: number): void {
+  setCache(`${PENDING_PROGRESS}${userId}:${fictionId}`, String(chapterId), STALE_TTL);
+}
+
+/** Royal Road is already at or past `local` (read elsewhere meanwhile). */
+function isAtOrPast(fictionId: number, userId: string, remote: number, local: number): boolean {
+  const ids = (getFictionCached(fictionId, userId)?.chapters ?? []).map((c) => c.id);
+  const [r, l] = [ids.indexOf(remote), ids.indexOf(local)];
+  return r >= 0 && l >= 0 ? r >= l : remote >= local;
+}
+
+/** Send queued progress; a failure leaves the rest queued for the next try. */
+export async function replayProgress(userId: string, follows?: FollowedFiction[]): Promise<void> {
+  const pending = getCacheByPrefix(`${PENDING_PROGRESS}${userId}:`);
+  if (!pending.length) return;
+  follows ??= await getFollows(userId);
+  for (const { key, value } of pending) {
+    const fictionId = Number(key.slice(key.lastIndexOf(":") + 1));
+    const chapterId = Number(value);
+    const remote = follows.find((f) => f.id === fictionId)?.lastReadChapterId;
+    if (!remote || !isAtOrPast(fictionId, userId, remote, chapterId)) {
+      await getChapter(chapterId, userId, undefined, { forceLive: true });
+      console.log(`[Offline] Synced queued progress: fiction ${fictionId}, chapter ${chapterId}`);
+    }
+    deleteCache(key);
+  }
+}
+
+onBackOnline(() => {
+  const users = new Set(getCacheByPrefix(PENDING_PROGRESS).map((row) => row.key.split(":")[1]));
+  for (const user of users) {
+    replayProgress(user).catch((error) => console.warn("[Offline] Progress replay failed:", (error as Error).message));
+  }
+});
 
 export async function validateCookies(userId: string): Promise<boolean> {
   try {

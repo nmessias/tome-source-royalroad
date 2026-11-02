@@ -36,6 +36,8 @@ async function getScraperFunctions() {
     getChapter: scraper.getChapter,
     getFiction: scraper.getFiction,
     isFictionCached: scraper.isFictionCached,
+    autoSaveFollows: scraper.autoSaveFollows,
+    replayProgress: scraper.replayProgress,
   };
 }
 
@@ -64,7 +66,7 @@ async function warmFollowsCache(): Promise<void> {
   console.log("[Job] Warming follows cache...");
   
   try {
-    const { getFollows, getChapter, getFiction, isFictionCached } = await getScraperFunctions();
+    const { getFollows, getChapter, getFiction, isFictionCached, autoSaveFollows, replayProgress } = await getScraperFunctions();
     
     if (isCached(`follows:${adminUserId}`)) {
       console.log("[Job] Follows list already cached, skipping fetch");
@@ -73,6 +75,9 @@ async function warmFollowsCache(): Promise<void> {
     
     const follows = await getFollows(adminUserId, CACHE_TTL.FOLLOWS, true);
     console.log(`[Job] Got ${follows.length} followed fictions`);
+
+    await replayProgress(adminUserId, follows).catch((err) => console.warn("[Job] Progress replay failed:", err.message));
+    await autoSaveFollows(adminUserId, follows);
     
     let cachedChapters = 0;
     let skippedChapters = 0;
