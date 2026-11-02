@@ -58,12 +58,15 @@ type BrowserContext = import("playwright").BrowserContext;
 type Page = import("playwright").Page;
 import type { Fiction, FollowedFiction, ChapterContent, ToplistType, HistoryEntry } from "tome";
 
-// Resource types to block for faster page loads (keep images for covers)
-// Everything the parser does not need. Images are the big one: a follows page
-// references a couple of cover thumbnails per entry and we only ever read the
-// src out of the markup, so downloading them just burns the machine's CPU and
-// bandwidth (and it makes Cloudflare challenges slower to settle).
-const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image'] as const;
+// Resource types to block for faster page loads. Everything the parser does
+// not need:
+// - images/fonts/media: covers are read out of the markup, never downloaded
+// - stylesheets: we parse HTML, so layout is pure cost
+// - scripts: Royal Road renders chapter and list pages server-side. Running the
+//   site's JS (analytics, ads, live widgets) only burns the single vCPU that the
+//   next navigation needs. Cloudflare's own challenge assets are exempt in
+//   blockResources, so an interstitial can still solve itself.
+const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'other', 'image', 'script'] as const;
 
 // How long to sit on a Cloudflare challenge before giving up on it.
 //
@@ -348,6 +351,13 @@ async function launchBrowser(): Promise<void> {
         // belt-and-braces.
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
+        // 512MB of RAM total on the production box. One renderer shared by the
+        // (max 2) concurrent pages, no GPU process, and a hard cap on V8's heap
+        // keep the browser from pushing the machine into swap-less thrashing.
+        "--renderer-process-limit=1",
+        "--disable-site-isolation-trials",
+        "--disable-gpu",
+        "--js-flags=--max-old-space-size=128",
         // Without this, headless Chrome advertises "HeadlessChrome/<version>"
         // and Cloudflare answers with a managed challenge that never clears.
         ...(browserUserAgent ? [`--user-agent=${browserUserAgent}`] : []),
@@ -792,8 +802,11 @@ export async function getPage(
       // and a content snapshot taken right after domcontentloaded can catch the
       // pre-redirect page. Ask the live DOM instead, then let the challenge
       // finish in place - a fresh goto would restart it and burn an attempt.
-      if (await pageIsChallengeShell(page)) {
-        console.log(`[Scraper] Cloudflare challenge on ${url} (attempt ${attempts}), waiting for it to clear...`);
+      const firstLook = await pageIsChallengeShell(page);
+      if (firstLook.challenged) {
+        console.log(
+          `[Scraper] Cloudflare challenge on ${url} (attempt ${attempts}, ${firstLook.reason}), waiting for it to clear...`
+        );
         // Wait in place: re-navigating restarts the challenge. On the direct
         // path the shared context keeps the clearance it earns here, which is
         // what makes every later page fast. Clearing cookies after a short
@@ -801,7 +814,9 @@ export async function getPage(
         // on every request. Only a configured proxy can move the exit IP
         // mid-session, so only then is a cookie reset worth trying.
         await waitForChallengeToClear(page, url, CHALLENGE_WAIT_MS);
-        if (await pageIsChallengeShell(page)) {
+        const secondLook = await pageIsChallengeShell(page);
+        if (secondLook.challenged) {
+          console.log(`[Scraper] Challenge still there after ${CHALLENGE_WAIT_MS}ms (${secondLook.reason})`);
           if (attempts >= maxAttempts) break;
           if (useAnon && BROWSER_PROXY) {
             await ctx.clearCookies().catch(() => {});
@@ -922,21 +937,24 @@ export async function getPage(
  * large part of the old 20s+ fetch times. Title plus a handful of selectors is
  * enough and costs milliseconds.
  */
-async function pageIsChallengeShell(page: Page): Promise<boolean> {
+async function pageIsChallengeShell(page: Page): Promise<{ challenged: boolean; reason?: string }> {
   try {
     const title = await page.title();
     if (/just a moment|attention required|checking your browser|cloudflare/i.test(title)) {
-      return true;
+      return { challenged: true, reason: `title "${title}"` };
     }
-    return await page.evaluate(() =>
-      !!document.querySelector(
+    const marker = await page.evaluate(() => {
+      const el = document.querySelector(
         "#challenge-form, #challenge-running, .cf-browser-verification, #cf-turnstile, " +
         "script[src*='challenges.cloudflare.com']"
-      )
-    );
+      );
+      if (!el) return null;
+      return el.id ? `#${el.id}` : el.className ? `.${el.className}` : el.tagName.toLowerCase();
+    });
+    return marker ? { challenged: true, reason: marker } : { challenged: false };
   } catch {
     // Mid-navigation or a closed page: let the next step report the real error.
-    return false;
+    return { challenged: false };
   }
 }
 
