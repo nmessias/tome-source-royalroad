@@ -551,6 +551,12 @@ describe("parseCards (expanded read-later card)", () => {
   });
 });
 
+test("parseFictionList reads logged-in expanded cards", () => {
+  const [f] = parseFictionList(`<html><body><div class="fiction-list">${EXPANDED_CARD}</div></body></html>`);
+  expect(f).toMatchObject({ id: 198033, title: "Kismet", stats: { rating: 4.27, followers: 3425, pages: 1559 } });
+  expect(f.coverUrl).toContain("covers-large/198033");
+});
+
 test("the follows card's New Chapters! badge marks it unread", () => {
   const html = `<div data-rr-expanded-fic-card><a href="/fiction/1/x"><h2>F</h2></a><strong>New Chapters!</strong></div>`;
   expect(parseCards(html)[0].hasUnread).toBe(true);

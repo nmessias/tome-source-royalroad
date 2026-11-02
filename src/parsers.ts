@@ -432,6 +432,21 @@ export function parseFictionList(html: string): Fiction[] {
 
   const items = document.querySelectorAll(".fiction-list-item");
 
+  // Logged in, Royal Road serves toplists and search as expanded cards, where
+  // the list markup above finds nothing; read those through parseCards.
+  if (items.length === 0) {
+    return parseCards(html).map((c) => ({
+      id: c.id,
+      title: c.title,
+      author: c.author,
+      url: c.href,
+      coverUrl: c.coverUrl,
+      description: c.description,
+      tags: c.tags,
+      stats: { rating: c.rating, followers: c.followers, pages: c.pageCount },
+    }));
+  }
+
   for (const item of items) {
     try {
       const titleEl = item.querySelector("h2.fiction-title a, .fiction-title a");
