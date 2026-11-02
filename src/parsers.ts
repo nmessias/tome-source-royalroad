@@ -775,9 +775,14 @@ export function parseFictionPage(html: string, id: number, url: string): ParsedF
   }
 
   // Continue Reading link
-  const continueLink = document.querySelector(
-    "a.btn[href*='/chapter/'][class*='continue'], a.btn-primary[href*='/chapter/'], a[class*='btn'][href*='/chapter/']"
-  );
+  // Only a link that says "Continue": logged out, the same button reads
+  // "Start Reading" and points at chapter one, which then posed as reading
+  // progress (Elydes' Continue opened its "Map" chapter 0).
+  const continueLink = [
+    ...document.querySelectorAll(
+      "a.btn[href*='/chapter/'][class*='continue'], a.btn-primary[href*='/chapter/'], a[class*='btn'][href*='/chapter/']"
+    ),
+  ].find((a) => /continue/i.test(a.textContent || ""));
   let continueChapterId: number | undefined;
   if (continueLink) {
     continueChapterId = idFromHref(continueLink.getAttribute("href") || "", 'chapter') ?? undefined;
@@ -836,7 +841,19 @@ export interface ParsedChapter {
 /** Nav links: an <a> in `.nav-buttons` whose text names the direction. */
 function parseNav(document: Document): { prevUrl?: string; nextUrl?: string } {
   const navButtons = document.querySelector('.nav-buttons');
-  if (!navButtons) return {};
+  if (!navButtons) {
+    // Logged-in redesign: no .nav-buttons, the links read "Previous Chapter" /
+    // "Next Chapter" (split across spans). Without this the reader had no
+    // prev/next at all.
+    const out: { prevUrl?: string; nextUrl?: string } = {};
+    for (const link of Array.from(document.querySelectorAll('a[href*="/chapter/"]'))) {
+      const text = (link.textContent || '').replace(/\s+/g, '');
+      const href = link.getAttribute('href') || undefined;
+      if (/^Prev(ious)?Chapter$/i.test(text)) out.prevUrl ??= href;
+      if (/^NextChapter$/i.test(text)) out.nextUrl ??= href;
+    }
+    return out;
+  }
   const out: { prevUrl?: string; nextUrl?: string } = {};
   for (const link of Array.from(navButtons.querySelectorAll('a[href*="/chapter/"]'))) {
     const text = link.textContent || '';
@@ -867,6 +884,19 @@ export function parseChapterPage(html: string, chapterId: number): ParsedChapter
 
   const titleEl = document.querySelector("h1.font-white, .chapter-title h1, h1");
   const title = titleEl?.textContent?.trim() || `Chapter ${chapterId}`;
+
+  // Redesign: no fiction link matched above. The id is in any fiction-scoped
+  // link; the page title reads "<chapter> - <fiction>".
+  if (!fictionId) {
+    for (const a of Array.from(document.querySelectorAll("a[href^='/fiction/']"))) {
+      const id = idFromHref(a.getAttribute("href") || "", 'fiction');
+      if (id) { fictionId = id; break; }
+    }
+  }
+  if (!fictionTitle) {
+    const pageTitle = document.querySelector("title")?.textContent?.trim() || "";
+    if (pageTitle.startsWith(`${title} - `)) fictionTitle = pageTitle.slice(title.length + 3).replace(/\s*\|\s*Royal Road$/, "");
+  }
 
   const contentEl = document.querySelector(".chapter-inner.chapter-content, .chapter-content");
   let cleanContent = "";

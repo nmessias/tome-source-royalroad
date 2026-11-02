@@ -365,8 +365,16 @@ describe("parseFictionPage (real fiction fixture)", () => {
     expect(parsed.fiction.chapters?.[2].isRead).toBeUndefined();
   });
 
-  test("extracts the continue-reading target", () => {
-    expect(fiction.continueChapterId).toBe(3966586);
+  // The fixture is logged out: its button reads "Start Reading" and points at
+  // chapter one. That is not reading progress, and treating it as such sent
+  // Continue to a fiction's first chapter (Elydes' "Map").
+  test("does not take a Start Reading button as the continue target", () => {
+    expect(fiction.continueChapterId).toBeUndefined();
+  });
+
+  test("takes a Continue Reading button as the continue target", () => {
+    const html = `<html><body><h1>F</h1><a class="inline-flex group/btn" href="/fiction/1/f/chapter/42/c">Continue Reading</a></body></html>`;
+    expect(parseFictionPage(html, 1, "u").fiction.continueChapterId).toBe(42);
   });
 
   test("extracts bookmark state and an antiforgery token", () => {
@@ -593,6 +601,20 @@ describe("parseFictionPage (logged-in redesign)", () => {
   test("reads bookmark state from the reactive buttons", () => {
     expect(fiction).toMatchObject({ isFollowing: true, isFavorite: false });
   });
+});
+
+test("parseChapterPage reads the logged-in redesign's nav and fiction", () => {
+  const html = `<html><head><title>Chapter 424 - Gathering Clouds - Elydes</title></head><body>
+    <a href="/fiction/67742/elydes">Elydes</a>
+    <h1>Chapter 424 - Gathering Clouds</h1>
+    <a href="/fiction/67742/elydes/chapter/4251389/c423"><span>Previous</span><span>Chapter</span></a>
+    <a href="/fiction/67742/elydes/chapter/4288639/c425"><span>Next</span><span>Chapter</span></a>
+    <div class="chapter-inner chapter-content"><p>Text.</p></div>
+  </body></html>`;
+  const parsed = parseChapterPage(html, 4272312);
+  expect(parsed).toMatchObject({ fictionId: 67742, fictionTitle: "Elydes" });
+  expect(parsed.prevChapterUrl).toContain("/chapter/4251389");
+  expect(parsed.nextChapterUrl).toContain("/chapter/4288639");
 });
 
 describe("parseHistoryPage (history card families)", () => {
