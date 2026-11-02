@@ -171,27 +171,6 @@ async function orStale<T>(key: string, live: () => Promise<T>): Promise<T> {
 
 // ============ Small helpers ============
 
-async function parallelLimit<T>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<void>
-): Promise<void> {
-  const executing: Promise<void>[] = [];
-
-  for (const item of items) {
-    const p = fn(item).then(() => {
-      executing.splice(executing.indexOf(p), 1);
-    });
-    executing.push(p);
-
-    if (executing.length >= limit) {
-      await Promise.race(executing);
-    }
-  }
-
-  await Promise.all(executing);
-}
-
 /**
  * Persist cookies learned from a browser visit. Royal Road rotates the
  * session cookie on use, so keeping the freshest copy stops the stored
@@ -285,6 +264,13 @@ function isContextInFlight(ctx: BrowserContext): boolean {
 async function ensureBrowser(): Promise<void> {
   if (!ENABLE_BROWSER) return;
 
+  // A launch in flight has already assigned `browser` but not yet its contexts,
+  // so awaiting here is what makes a concurrent caller safe.
+  if (initPromise) {
+    await initPromise;
+    return;
+  }
+
   if (!browser || !browser.isConnected()) {
     if (browser) {
       console.log("Browser disconnected, reinitializing...");
@@ -319,12 +305,29 @@ function chromeUserAgent(executablePath: string): string | undefined {
   }
 }
 
+/**
+ * In-flight launch. Concurrent callers must not start a second Chromium, and -
+ * more subtly - must not treat `browser` as ready before its contexts exist:
+ * that produced "Browser contexts not initialized" when the startup cache warm
+ * raced the feature's own browser init.
+ */
+let initPromise: Promise<void> | null = null;
+
 export async function initBrowser(): Promise<void> {
   if (!ENABLE_BROWSER) {
     console.log("Browser disabled (ENABLE_BROWSER=false)");
     return;
   }
 
+  if (browser) return;
+  if (initPromise) return initPromise;
+  initPromise = launchBrowser().finally(() => {
+    initPromise = null;
+  });
+  return initPromise;
+}
+
+async function launchBrowser(): Promise<void> {
   if (browser) return;
 
   console.log(`Initializing ${BROWSER_ENGINE} browser (headless=${BROWSER_HEADLESS}, proxy=${BROWSER_PROXY?.server ?? "none"})...`);
@@ -741,9 +744,14 @@ export async function getPage(
     // The page's own navigation is never blocked, whatever host a redirect lands
     // on; ad iframes are sub-frame navigations and stay blocked.
     const pageNavigation = request.isNavigationRequest() && request.frame() === p.mainFrame();
+    // A Cloudflare challenge needs its own scripts and XHRs. Blocking those
+    // made the interstitial impossible to clear, so every challenge turned
+    // into a full retry loop.
+    const challengeAsset = /challenges\.cloudflare\.com|cdn-cgi\/challenge-platform/.test(request.url());
     if (
-      BLOCKED_RESOURCE_TYPES.includes(request.resourceType() as any) ||
-      (!pageNavigation && isThirdParty(request.url()))
+      !challengeAsset &&
+      (BLOCKED_RESOURCE_TYPES.includes(request.resourceType() as any) ||
+        (!pageNavigation && isThirdParty(request.url())))
     ) {
       route.abort();
     } else {
@@ -777,16 +785,14 @@ export async function getPage(
         waitUntil: "domcontentloaded",
         timeout: SCRAPER_TIMEOUT
       });
-      console.log(`[Scraper] Navigation completed in ${Date.now() - navStart}ms`);
-
-      let pageContent = await stableContent(page);
+      const navMs = Date.now() - navStart;
 
       // Cloudflare's current interstitial is a bare "Just a moment..." shell
-      // that loads its challenge in JS, so the old markers above match nothing
+      // that loads its challenge in JS, so content markers alone match nothing
       // and a content snapshot taken right after domcontentloaded can catch the
-      // pre-redirect page. Let the challenge finish in place, then re-read —
-      // a fresh goto would restart it and burn an attempt.
-      if (looksLikeChallenge(pageContent)) {
+      // pre-redirect page. Ask the live DOM instead, then let the challenge
+      // finish in place - a fresh goto would restart it and burn an attempt.
+      if (await pageIsChallengeShell(page)) {
         console.log(`[Scraper] Cloudflare challenge on ${url} (attempt ${attempts}), waiting for it to clear...`);
         // Wait in place: re-navigating restarts the challenge. On the direct
         // path the shared context keeps the clearance it earns here, which is
@@ -795,9 +801,7 @@ export async function getPage(
         // on every request. Only a configured proxy can move the exit IP
         // mid-session, so only then is a cookie reset worth trying.
         await waitForChallengeToClear(page, url, CHALLENGE_WAIT_MS);
-        pageContent = await stableContent(page);
-
-        if (looksLikeChallenge(pageContent)) {
+        if (await pageIsChallengeShell(page)) {
           if (attempts >= maxAttempts) break;
           if (useAnon && BROWSER_PROXY) {
             await ctx.clearCookies().catch(() => {});
@@ -811,7 +815,10 @@ export async function getPage(
         sessionReset = false;
       }
 
-      if (looksLikeLoginPage(pageContent, page.url())) {
+      // Same reasoning as the challenge probe: ask the live DOM instead of
+      // serialising it, so a dead session is still caught before the selector
+      // timeout rather than after.
+      if (await pageIsLoginShell(page)) {
         console.warn("[Scraper] WARNING: Redirected to login page - cookies may be invalid or expired!");
         if (userId && !opts.alreadyRetriedWithLogin && ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
           markSessionDead(userId);
@@ -883,8 +890,10 @@ export async function getPage(
       }
 
       const content = await stableContent(page);
-      console.log(`[Scraper] Browser page fetched in ${Date.now() - startTime}ms total`);
-      await rememberCookiesFromBrowser(ctx, wantAuth ? userId : undefined);
+      console.log(
+        `[Scraper] Browser page fetched in ${Date.now() - startTime}ms total ` +
+        `(nav ${navMs}ms, ${content.length} bytes)`
+      );      await rememberCookiesFromBrowser(ctx, wantAuth ? userId : undefined);
       const release = async () => {
         try { await page.close(); } catch {}
         await closeOwned();
@@ -905,29 +914,102 @@ export async function getPage(
 }
 
 /**
- * Resolve a redirect URL to get the final URL (used for /chapter/next/ URLs).
+ * Is the current document Cloudflare's interstitial rather than the page?
  *
- * The browser follows the redirect and `page.url()` is the final location. A
- * raw HTTP request cannot be used here any more, and it was fragile anyway:
- * `response.url` silently returns the *requested* URL when the server refuses
- * (Cloudflare answering 403). That used to make `/chapter/next/192682` resolve
- * to chapter id 192682 - the fiction id - which pointed the Follows "read next"
- * button at a chapter that does not exist.
+ * This deliberately does not serialise the DOM: `page.content()` on a
+ * still-loading Royal Road page costs seconds on a 1 vCPU box, and doing it
+ * twice per fetch (once to look for a challenge, once for the result) was a
+ * large part of the old 20s+ fetch times. Title plus a handful of selectors is
+ * enough and costs milliseconds.
  */
-async function resolveRedirectUrl(url: string, userId?: string): Promise<string | null> {
+async function pageIsChallengeShell(page: Page): Promise<boolean> {
   try {
-    const { page, release } = await getPage(url, undefined, userId);
-    try {
-      const finalUrl = page?.url();
-      if (!finalUrl) return null;
-      return finalUrl !== url && finalUrl !== `${url}/` ? finalUrl : null;
-    } finally {
-      await release();
+    const title = await page.title();
+    if (/just a moment|attention required|checking your browser|cloudflare/i.test(title)) {
+      return true;
     }
-  } catch (error) {
-    console.error(`Failed to resolve redirect for ${url}:`, error);
-    return null;
+    return await page.evaluate(() =>
+      !!document.querySelector(
+        "#challenge-form, #challenge-running, .cf-browser-verification, #cf-turnstile, " +
+        "script[src*='challenges.cloudflare.com']"
+      )
+    );
+  } catch {
+    // Mid-navigation or a closed page: let the next step report the real error.
+    return false;
   }
+}
+
+/**
+ * Is the current document Royal Road's login page, i.e. was the session
+ * rejected? Same cheap-probe reasoning as `pageIsChallengeShell`, and the same
+ * two signals the HTML check used: the redirect target and the sign-in form.
+ */
+async function pageIsLoginShell(page: Page): Promise<boolean> {
+  if (page.url().includes("/account/login")) return true;
+  try {
+    return await page.evaluate(() => {
+      if (/^\s*Sign In\s*\|/i.test(document.title)) return true;
+      return !!document.querySelector('form[action="/account/login"]');
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve `/chapter/next/<fictionId>` redirects inside the page, without
+ * rendering anything.
+ *
+ * Each of these is a 302 to the actual next chapter, so all we need is the
+ * final URL. Navigating a page per URL meant loading 40-odd full chapter pages
+ * every time the follows cache was warmed. An in-page `fetch()` runs on the
+ * Royal Road origin with the browser's cookies and network stack (so Cloudflare
+ * sees the same client), follows the redirect, and returns the final URL with
+ * no DOM, no scripts and no subresources.
+ *
+ * Returns a map of requested URL -> final URL. Unresolved URLs are omitted.
+ */
+async function resolveRedirectsInPage(
+  page: Page,
+  urls: string[],
+  concurrency: number = 6
+): Promise<Map<string, string>> {
+  if (urls.length === 0) return new Map();
+  const pairs = await page.evaluate(
+    async ({ urls, concurrency }) => {
+      const out: [string, string][] = [];
+      let next = 0;
+      const worker = async () => {
+        while (next < urls.length) {
+          const url = urls[next++];
+          try {
+            const res = await fetch(url, {
+              redirect: "follow",
+              credentials: "include",
+              cache: "no-store",
+            });
+            // `res.url` is the final URL after the redirect chain; an opaque
+            // redirect or a rejection leaves it equal to the request. The body
+            // is not needed, so drop it instead of downloading a whole chapter
+            // per URL.
+            const finalUrl = res.url;
+            const ok = res.ok;
+            res.body?.cancel().catch(() => {});
+            if (ok && finalUrl && finalUrl !== url) out.push([url, finalUrl]);
+          } catch {
+            // Leave it unresolved; the caller keeps the read link unset.
+          }
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(concurrency, urls.length) }, worker)
+      );
+      return out;
+    },
+    { urls, concurrency }
+  );
+  return new Map(pairs);
 }
 
 export async function closeBrowser(): Promise<void> {
@@ -988,64 +1070,73 @@ async function getFollowsLive(userId: string, ttl: number): Promise<FollowedFict
     return JSON.parse(cached);
   }
 
-  const { content, release } = await getPage(
+  const { page, content, release } = await getPage(
     `${ROYAL_ROAD_BASE_URL}/my/follows`,
     FICTION_CARD_WAIT_SELECTOR,
     userId,
   );
-  await release();
 
-  const cards = parseCards(content);
-  console.log(`Found ${cards.length} fiction cards`);
+  try {
+    const cards = parseCards(content);
+    console.log(`Found ${cards.length} fiction cards`);
 
-  // Carry the unresolved redirect target alongside each row so the parallel
-  // resolver below can find it without a second parse.
-  const fictions = cards.map((card) => ({
-    ...toFollowedFiction(card),
-    ...(card.nextChapterResolveUrl ? { __resolveUrl: card.nextChapterResolveUrl } : {}),
-  })) as (FollowedFiction & { __resolveUrl?: string })[];
+    // Carry the unresolved redirect target alongside each row so the resolver
+    // below can find it without a second parse.
+    const fictions = cards.map((card) => ({
+      ...toFollowedFiction(card),
+      ...(card.nextChapterResolveUrl ? { __resolveUrl: card.nextChapterResolveUrl } : {}),
+    })) as (FollowedFiction & { __resolveUrl?: string })[];
 
-  // Resolve /chapter/next/ redirect URLs to get actual chapter IDs
-  const needing = fictions.filter((f) => !!f.__resolveUrl && !f.nextChapterId);
+    // Resolve /chapter/next/ redirect URLs to get actual chapter IDs. These run
+    // inside the follows page we already have open: no extra navigations.
+    const needing = fictions.filter((f) => !!f.__resolveUrl && !f.nextChapterId);
 
-  if (needing.length > 0) {
-    const startTime = Date.now();
-    console.log(`Resolving ${needing.length} next chapter redirect URLs (parallel, max 10)...`);
+    if (needing.length > 0) {
+      if (!page) {
+        console.warn(`Cannot resolve ${needing.length} next chapter URLs without a browser page`);
+      } else {
+        const startTime = Date.now();
+        console.log(`Resolving ${needing.length} next chapter redirect URLs in-page...`);
+        const resolved = await resolveRedirectsInPage(
+          page,
+          needing.map((f) => f.__resolveUrl!)
+        );
+        console.log(
+          `Resolved ${resolved.size}/${needing.length} redirect URLs in ${Date.now() - startTime}ms`
+        );
 
-    await parallelLimit(needing, 10, async (fiction) => {
-      const resolve = fiction.__resolveUrl;
-      if (!resolve) return;
+        for (const fiction of needing) {
+          const resolve = fiction.__resolveUrl;
+          if (!resolve) continue;
 
-      try {
-        const finalUrl = await resolveRedirectUrl(resolve, userId);
-        const chapterId = finalUrl ? finalUrl.match(/\/chapter\/(\d+)/)?.[1] : undefined;
+          const finalUrl = resolved.get(resolve);
+          const chapterId = finalUrl ? finalUrl.match(/\/chapter\/(\d+)/)?.[1] : undefined;
 
-        // The redirect target must be a chapter *other than* the fiction id
-        // that was in the /chapter/next/<id> path. Anything else means the
-        // redirect never resolved (challenge, 405, ...) and the id we read is
-        // the fiction's own, which would link to a chapter that does not exist.
-        const requestedFictionId = resolve.match(/\/chapter\/next\/(\d+)/)?.[1];
-        if (chapterId && chapterId !== requestedFictionId) {
-          fiction.nextChapterId = parseInt(chapterId, 10);
-        } else if (chapterId) {
-          console.warn(
-            `[Scraper] Next-chapter redirect for "${fiction.title}" did not resolve ` +
-            `(got ${chapterId}, same as the fiction id) - leaving the read link unset`
-          );
+          // The redirect target must be a chapter *other than* the fiction id
+          // that was in the /chapter/next/<id> path. Anything else means the
+          // redirect never resolved (challenge, 405, ...) and the id we read is
+          // the fiction's own, which would link to a chapter that does not exist.
+          const requestedFictionId = resolve.match(/\/chapter\/next\/(\d+)/)?.[1];
+          if (chapterId && chapterId !== requestedFictionId) {
+            fiction.nextChapterId = parseInt(chapterId, 10);
+          } else if (chapterId) {
+            console.warn(
+              `[Scraper] Next-chapter redirect for "${fiction.title}" did not resolve ` +
+              `(got ${chapterId}, same as the fiction id) - leaving the read link unset`
+            );
+          }
         }
-      } catch (e) {
-        console.error(`Failed to resolve next chapter URL for "${fiction.title}":`, e);
       }
-    });
+    }
 
-    console.log(`Resolved ${needing.length} redirect URLs in ${Date.now() - startTime}ms`);
+    if (fictions.length > 0) {
+      setCacheWithStale(cacheKey, JSON.stringify(fictions), ttl);
+    }
+
+    return fictions;
+  } finally {
+    await release();
   }
-
-  if (fictions.length > 0) {
-    setCacheWithStale(cacheKey, JSON.stringify(fictions), ttl);
-  }
-
-  return fictions;
 }
 
 export async function getHistory(userId: string): Promise<HistoryEntry[]> {
