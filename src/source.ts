@@ -15,7 +15,9 @@ import {
   getToplistCached,
   getFollowsCached,
   getFiction,
+  getFictionCached,
   getChapter,
+  scheduleReadAhead,
   validateCookies,
   createContext,
   searchFictions,
@@ -31,8 +33,10 @@ import { ROYAL_ROAD_AUTO_LOGIN_ENABLED, ENABLE_BROWSER } from "./config";
 import { performBrowserLogin } from "./scraper";
 import { triggerCacheWarm } from "./jobs";
 import { clearCache } from "tome";
+import { SingleFlight } from "./single-flight";
 
 const RR = "royalroad";
+const progressFlights = new SingleFlight<string, void>();
 
 function parseId(ref: string): number | null {
   const id = parseInt(ref, 10);
@@ -87,11 +91,13 @@ export const royalroadSource: Source = {
     if (id === null) return null;
     return getFiction(id, userId);
   },
-  async getChapter(ref, chapterRef, userId) {
+  async getChapter(ref, chapterRef, userId, options?: { readAheadDepth?: number }) {
     const id = parseId(chapterRef);
     if (id === null) return null;
     const chapter = await getChapter(id, userId);
     if (!chapter) return null;
+    const fictionId = parseId(ref);
+    if (userId && fictionId !== null) scheduleReadAhead(fictionId, id, userId, options?.readAheadDepth);
     return normalizeChapter(chapter, ref);
   },
 
@@ -108,9 +114,6 @@ export const royalroadSource: Source = {
   getToplist(toplist, userId, ttl) {
     return getToplist(toplist, userId, ttl);
   },
-  getFollowsCached(userId) {
-    return getFollowsCached(userId);
-  },
   getToplistCached(toplist) {
     return getToplistCached(toplist);
   },
@@ -119,13 +122,19 @@ export const royalroadSource: Source = {
     if (id === null) return { success: false, error: "Invalid fiction id" };
     return setBookmark(userId, id, type as "follow" | "favorite" | "ril", mark, csrf);
   },
-  // RR "marks read" by re-fetching the chapter in an authenticated context
-  async updateProgress(userId, _fictionRef, chapterRef) {
+  // Synchronize progress with an authenticated chapter visit. An authorized
+  // live test confirmed that this advances Royal Road's reading position.
+  async updateProgress(userId, _fictionRef, chapterRef, body?: unknown) {
     const id = parseId(chapterRef);
     if (id === null) return;
-    // Mark-as-read requires a real authenticated upstream fetch (that's how RR
-    // records read state); forceLive bypasses the cache-first fast path.
-    await getChapter(id, userId, undefined, { forceLive: true });
+    const fictionId = parseId(_fictionRef);
+    const depth = body && typeof body === "object" && "readAheadDepth" in body
+      ? (body as { readAheadDepth?: number }).readAheadDepth : undefined;
+    if (fictionId !== null) scheduleReadAhead(fictionId, id, userId, depth);
+    // Bypass the shared content cache for the authenticated visit.
+    await progressFlights.run(userId + ":" + id, async () => {
+      await getChapter(id, userId, undefined, { forceLive: true });
+    });
   },
 
   // ---- credentials ----
@@ -190,3 +199,14 @@ export const royalroadSource: Source = {
     },
   },
 };
+
+// Optional cache-only hooks; older core Source types do not declare them.
+Object.assign(royalroadSource, {
+  getFollowsCached(userId: string) {
+    return getFollowsCached(userId);
+  },
+  getFictionCached(ref: string, userId?: string) {
+    const id = parseId(ref);
+    return id === null ? null : getFictionCached(id, userId);
+  },
+});

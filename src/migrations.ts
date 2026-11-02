@@ -4,6 +4,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { AUTH_USERNAME } from "tome";
+import { backfillChapterMetadata } from "./chapter-metadata-migration";
 
 export function migrateRoyalRoad(db: Database): void {
   // A migration failure must never stop Tome from starting. This plugin is a
@@ -11,6 +12,7 @@ export function migrateRoyalRoad(db: Database): void {
   try {
     migrateGlobalCookiesToAdmin(db);
     autoEnableRoyalRoadForExistingUsers(db);
+    backfillChapterMetadata(db);
   } catch (e) {
     console.error("[royalroad] Migration failed; continuing without it:", e);
   }

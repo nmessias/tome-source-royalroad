@@ -11,17 +11,24 @@
  */
 import { parseHTML } from "linkedom";
 import { execFileSync } from "node:child_process";
-import { getCache, setCache, deleteCache } from "tome";
+import { getCache, setCache, deleteCache, isCached } from "tome";
 import { CACHE_TTL } from "tome";
 import {
   getRoyalRoadCookiesForPlaywright,
   hasRoyalRoadSession,
   setRoyalRoadCookie,
   markSessionDead,
-  clearSessionState,
   isSessionKnownDead,
+  clearSessionState,
 } from "./royalroad-credentials";
 import { deleteCacheByPrefix } from "./cache";
+import { SingleFlight } from "./single-flight";
+import { PrioritySemaphore } from "./priority-semaphore";
+import { ReadAheadQueue } from "./read-ahead";
+import { withStale } from "./stale-cache";
+import { useAuthenticatedContext } from "./context-selection";
+import { FICTION_CONTENT_PROBE, FICTION_READY_SELECTOR } from "./fiction-readiness";
+import { fictionCacheKey as makeFictionCacheKey } from "./fiction-cache-key";
 import {
   ROYAL_ROAD_BASE_URL,
   ROYAL_ROAD_USERNAME,
@@ -96,35 +103,7 @@ const MAX_CONCURRENT_BROWSER_FETCHES = parseInt(
   10
 );
 
-/** Minimal counting semaphore with an idempotent release. */
-class Semaphore {
-  private active = 0;
-  private waiting: (() => void)[] = [];
-
-  constructor(private readonly max: number) {}
-
-  /** Resolves once a slot is free; the returned fn frees it again. */
-  async acquire(): Promise<() => void> {
-    while (this.active >= this.max) {
-      await new Promise<void>((resolve) => this.waiting.push(resolve));
-    }
-    this.active++;
-    return this.makeRelease();
-  }
-
-  private makeRelease(): () => void {
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      this.active--;
-      const next = this.waiting.shift();
-      if (next) next();
-    };
-  }
-}
-
-const browserSlots = new Semaphore(MAX_CONCURRENT_BROWSER_FETCHES);
+const browserSlots = new PrioritySemaphore(MAX_CONCURRENT_BROWSER_FETCHES);
 
 // ============ Cache keys ============
 
@@ -142,11 +121,15 @@ export type FollowedFictionWithRecency = FollowedFiction & {
 /**
  * Fiction pages are cached per user: they carry the antiforgery token and the
  * reader's own follow/read state, so one user's row must never be served to
- * another. `fiction:<id>:<userId>` also lets a single fiction be invalidated
- * for everyone with a prefix delete.
+ * another. Versioned keys also exclude anonymous rows cached under user IDs
+ * by older versions; prefix deletion still invalidates one fiction for everyone.
  */
 function fictionCacheKey(id: number | string, userId?: string): string {
-  return `fiction:${id}:${userId ?? "anon"}`;
+  return makeFictionCacheKey(id, userId, !!userId && hasRoyalRoadSession(userId) && !isSessionKnownDead(userId));
+}
+
+export function isFictionCached(id: number, userId?: string): boolean {
+  return isCached(fictionCacheKey(id, userId));
 }
 
 // ============ Stale-if-error ============
@@ -166,15 +149,11 @@ function setCacheWithStale(key: string, value: string, ttl: number): void {
  * optional proxy is down - serve the last good copy instead of an error page.
  * Rethrows when there is no such copy or the failure is not a connectivity one.
  */
-async function orStale<T>(key: string, live: () => Promise<T>): Promise<T> {
-  try {
-    return await live();
-  } catch (e) {
-    const stale = isUnreachable(e) ? getCache(staleKey(key)) : null;
-    if (stale === null) throw e;
-    console.warn(`[Cache] ${key}: Royal Road unreachable (${String((e as Error).message).split("\n")[0].slice(0, 90)}) - serving the last good copy`);
-    return JSON.parse(stale) as T;
-  }
+async function orStale<T>(key: string, live: () => Promise<T>, markStale?: () => void): Promise<T> {
+  return withStale(live, () => getCache(staleKey(key)), isUnreachable, (error) => {
+    markStale?.();
+    console.warn(`[Cache] ${key}: Royal Road unreachable (${String((error as Error).message).split("\n")[0].slice(0, 90)}) - serving the last good copy`);
+  });
 }
 
 // ============ Small helpers ============
@@ -630,19 +609,98 @@ function assertHasContent(label: string, content: string, probe: RegExp): void {
 /** Probes for the anchor element each page type must contain. */
 const CONTENT_PROBE = {
   chapter: /class="[^"]*\bchapter-content\b/,
-  fiction: /class="[^"]*\bfic-title\b/,
+  fiction: FICTION_CONTENT_PROBE,
   list: /class="[^"]*\bfiction-list\b/,
 };
 
-/**
- * Background chapter pre-caching, serialised so it never runs concurrently
- * with a live read on the shared browser context.
- */
-let preCacheChain: Promise<void> = Promise.resolve();
+const chapterFlights = new SingleFlight<number, ChapterContent>();
+const fictionFlights = new SingleFlight<string, Fiction | null>();
+const followsFlights = new SingleFlight<string, FollowedFiction[]>();
+const readAheadSetting = Number(process.env.ROYAL_ROAD_READ_AHEAD ?? "3");
+const readAheadDepth = Number.isFinite(readAheadSetting) ? Math.max(0, Math.min(10, Math.floor(readAheadSetting))) : 3;
+const readAhead = new ReadAheadQueue({
+  cached: (id) => isCached(`chapter:${id}`),
+  fetch: (id) => getChapter(id, undefined, CHAPTER_CACHE_TTL),
+});
+const discoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const discoveryCooldown = new Map<string, number>();
+const discoveryGeneration = new Map<string, number>();
+const discoveryTargets = new Map<string, string>();
+const discoveryDepths = new Map<string, number>();
+const discoveryControllers = new Map<string, AbortController>();
+
+/** Queue chapters from cached fiction metadata and refresh missing metadata in the background. */
+export function scheduleReadAhead(fictionId: number, chapterId: number, userId: string, depth?: number): void {
+  const requestedDepth = depth ?? readAheadDepth;
+  const count = Number.isFinite(requestedDepth) ? Math.max(0, Math.min(10, Math.floor(requestedDepth))) : readAheadDepth;
+  const target = fictionId + ":" + chapterId;
+  let generation = discoveryGeneration.get(userId) ?? 0;
+  if (discoveryTargets.get(userId) !== target || count === 0) {
+    generation++;
+    discoveryGeneration.set(userId, generation);
+    discoveryTargets.set(userId, target);
+    const oldTimer = discoveryTimers.get(userId);
+    if (oldTimer) clearTimeout(oldTimer);
+    discoveryTimers.delete(userId);
+    discoveryControllers.get(userId)?.abort();
+    discoveryControllers.delete(userId);
+  }
+  discoveryDepths.set(userId, count);
+  const key = fictionCacheKey(fictionId, userId);
+  const metadataKey = `chapter-meta:royalroad:${fictionId}:${chapterId}`;
+  const metadata = getCache(metadataKey);
+  if (metadata) {
+    try {
+      const record = JSON.parse(metadata);
+      record.lastAccessedAt = Date.now();
+      setCache(metadataKey, JSON.stringify(record), Math.max(STALE_TTL, CHAPTER_CACHE_TTL));
+    } catch { /* Ignore invalid optional metadata. */ }
+  }
+  const fresh = getCache(key);
+  const cached = fresh ?? getCache(staleKey(key));
+  let chapters: Fiction["chapters"] = [];
+  try {
+    if (cached) chapters = (JSON.parse(cached) as Fiction).chapters ?? [];
+  } catch (error) {
+    console.warn("[ReadAhead] Could not parse cached fiction:", (error as Error).message);
+  }
+  const index = chapters.findIndex((chapter) => chapter.id === chapterId);
+  const next = index < 0 ? [] : chapters.slice(index + 1).map((chapter) => chapter.id);
+  readAhead.enqueue(userId, String(fictionId), next, count);
+
+  if (count <= 0 || (fresh && index >= 0) || (discoveryCooldown.get(key) ?? 0) > Date.now()) return;
+  if (discoveryTimers.has(userId) || discoveryControllers.has(userId)) return;
+  if (discoveryTimers.size + discoveryControllers.size >= 20) return;
+  const timer = setTimeout(() => {
+    if (discoveryTimers.get(userId) !== timer) return;
+    discoveryTimers.delete(userId);
+    const cooldownUntil = Date.now() + 120_000;
+    discoveryCooldown.set(key, cooldownUntil);
+    if (discoveryCooldown.size > 100) discoveryCooldown.delete(discoveryCooldown.keys().next().value!);
+    const controller = new AbortController();
+    discoveryControllers.set(userId, controller);
+    void getFictionLive(fictionId, userId, CACHE_TTL.FICTION, true, index < 0, controller.signal)
+      .then(() => {
+        if (discoveryGeneration.get(userId) === generation) scheduleReadAhead(fictionId, chapterId, userId, discoveryDepths.get(userId));
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) console.warn("[ReadAhead] Fiction discovery failed:", (error as Error).message);
+      })
+      .finally(() => {
+        if (controller.signal.aborted && discoveryCooldown.get(key) === cooldownUntil) discoveryCooldown.delete(key);
+        if (discoveryControllers.get(userId) === controller) discoveryControllers.delete(userId);
+      });
+  }, 3000);
+  discoveryTimers.set(userId, timer);
+}
 
 // ============ Page fetching ============
 
 export interface GetPageOptions {
+  /** Speculative work yields to queued interactive requests. */
+  background?: boolean;
+  /** Cancel speculative work while it is waiting for a browser slot. */
+  signal?: AbortSignal;
   /** Set once an auto-login retry has already been attempted. */
   alreadyRetriedWithLogin?: boolean;
   /**
@@ -690,10 +748,10 @@ export async function getPage(
   waitForSelector?: string,
   userId?: string,
   opts: GetPageOptions = {}
-): Promise<{ page: Page | null; content: string; release: () => Promise<void> }> {
+): Promise<{ page: Page | null; content: string; authenticated: boolean; release: () => Promise<void> }> {
   const startTime = Date.now();
   const allowAnonymous = opts.allowAnonymous === true;
-  const hasSession = userId ? hasRoyalRoadSession(userId) : false;
+  let hasSession = userId ? hasRoyalRoadSession(userId) : false;
 
   if (userId && !hasSession && !allowAnonymous) {
     if (ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
@@ -704,14 +762,14 @@ export async function getPage(
       if (!(await performBrowserLogin(userId))) {
         throw new Error("Auto-login failed. Please configure your Royal Road session manually.");
       }
+      hasSession = hasRoyalRoadSession(userId);
+      if (!hasSession) throw new Error("Auto-login did not provide a Royal Road session.");
     } else {
       throw new Error("Session cookies not configured. Please set up your Royal Road cookies first.");
     }
   }
 
-  // With a public page and no usable session, go straight to anonymous: there
-  // is nothing an authenticated fetch would add.
-  const wantAuth = !!userId && hasSession && !(allowAnonymous && isSessionKnownDead(userId));
+  const wantAuth = useAuthenticatedContext(userId, hasSession, allowAnonymous, userId ? isSessionKnownDead(userId) : false);
 
   if (!ENABLE_BROWSER) {
     throw new Error("Browser is disabled (ENABLE_BROWSER=false). It is the only transport Royal Road accepts.");
@@ -727,7 +785,7 @@ export async function getPage(
 
   // The anonymous context serves both anonymous requests and the fallback for
   // a rejected session, so a public page never depends on auth at all.
-  let useAnon = !wantAuth || allowAnonymous;
+  let useAnon = !wantAuth;
   let ctx: BrowserContext | null = useAnon ? anonContext : context;
 
   if (!useAnon && userId) {
@@ -789,15 +847,30 @@ export async function getPage(
 
   // Hold a slot for as long as this request owns a page. Released from
   // closeOwned, which every return and error path funnels through.
-  const releaseSlot = await browserSlots.acquire();
+  let releaseSlot: () => void;
+  try {
+    releaseSlot = await browserSlots.acquire(opts.background, opts.signal);
+  } catch (error) {
+    await releaseRequestContext();
+    throw error;
+  }
 
   const closeOwned = async () => {
     releaseSlot();
     await releaseRequestContext();
   };
 
-  let page = await ctx.newPage();
-  await blockResources(page);
+  let page: Page;
+  try {
+    page = await ctx.newPage();
+    try { await blockResources(page); } catch (error) {
+      await page.close().catch(() => {});
+      throw error;
+    }
+  } catch (error) {
+    await closeOwned();
+    throw error;
+  }
 
   try {
     let attempts = 0;
@@ -894,6 +967,7 @@ export async function getPage(
         }
 
         if (allowAnonymous) {
+          if (userId) markSessionDead(userId);
           console.warn(`[Scraper] Login redirect on a public page - serving ${url} anonymously`);
           try { await page.close(); } catch {}
           useAnon = true;
@@ -934,7 +1008,7 @@ export async function getPage(
         try { await page.close(); } catch {}
         await closeOwned();
       };
-      return { page, content, release };
+      return { page, content, authenticated: !useAnon, release };
     }
 
     throw new Error(
@@ -1077,7 +1151,7 @@ function toFollowedFiction(card: ParsedCard): FollowedFictionWithRecency {
 }
 
 export function getFollows(userId: string, ttl: number = CACHE_TTL.FOLLOWS): Promise<FollowedFiction[]> {
-  return orStale(`follows:${userId}`, () => getFollowsLive(userId, ttl));
+  return orStale(`follows:${userId}`, () => followsFlights.run(userId, () => getFollowsLive(userId, ttl)));
 }
 
 async function getFollowsLive(userId: string, ttl: number): Promise<FollowedFiction[]> {
@@ -1216,20 +1290,29 @@ export function getToplistCached(toplist: ToplistType): Fiction[] | null {
   return null;
 }
 
-export function getFiction(id: number, userId?: string, ttl: number = CACHE_TTL.FICTION): Promise<Fiction | null> {
-  return orStale(fictionCacheKey(id, userId), () => getFictionLive(id, userId, ttl));
+/** Read fiction metadata without launching a browser navigation. */
+export function getFictionCached(id: number, userId?: string): Fiction | null {
+  const key = fictionCacheKey(id, userId);
+  const value = getCache(key) ?? getCache(staleKey(key));
+  if (!value) return null;
+  try { return JSON.parse(value) as Fiction; } catch { return null; }
 }
 
-async function getFictionLive(id: number, userId: string | undefined, ttl: number): Promise<Fiction | null> {
+export function getFiction(id: number, userId?: string, ttl: number = CACHE_TTL.FICTION): Promise<Fiction | null> {
+  const key = fictionCacheKey(id, userId);
+  return orStale(key, () => fictionFlights.run(key, () => getFictionLive(id, userId, ttl)));
+}
+
+async function getFictionLive(id: number, userId: string | undefined, ttl: number, background = false, force = false, signal?: AbortSignal): Promise<Fiction | null> {
   const cacheKey = fictionCacheKey(id, userId);
-  const cached = getCache(cacheKey);
+  const cached = force ? null : getCache(cacheKey);
   if (cached) {
     console.log(`Returning cached fiction: ${id}`);
     return JSON.parse(cached);
   }
 
   const url = `${ROYAL_ROAD_BASE_URL}/fiction/${id}`;
-  const { content, release } = await getPage(url, ".fic-title", userId, { allowAnonymous: true });
+  const { content, release, authenticated } = await getPage(url, FICTION_READY_SELECTOR, userId, { allowAnonymous: true, background, signal });
   await release();
 
   assertHasContent("the fiction header", content, CONTENT_PROBE.fiction);
@@ -1240,7 +1323,8 @@ async function getFictionLive(id: number, userId: string | undefined, ttl: numbe
   // paths used to disagree on the chapter list.
   const parsed = parseFictionPage(content, id, url);
 
-  setCacheWithStale(cacheKey, JSON.stringify(parsed.fiction), ttl);
+  const resultKey = authenticated ? makeFictionCacheKey(id, userId, true) : makeFictionCacheKey(id);
+  setCacheWithStale(resultKey, JSON.stringify(parsed.fiction), ttl);
   return parsed.fiction;
 }
 
@@ -1256,8 +1340,7 @@ export async function getChapter(
   // Cache-first on every path. The reader's live GETs used to skip the cache
   // entirely (only pre-caching consulted it), so every chapter read re-scraped
   // Royal Road from scratch and never reused the cached row. Only the
-  // mark-as-read path (forceLive) must hit upstream — that's how RR records
-  // read state.
+  // progress synchronization attempt (forceLive) bypasses the content cache.
   if (!opts?.forceLive) {
     const cached = getCache(cacheKey);
     if (cached) {
@@ -1266,21 +1349,49 @@ export async function getChapter(
     }
   }
 
+  // Content is public and shared; progress updates must always remain separate.
+  const fetchContent = () => chapterFlights.run(chapterId, async () => {
+        // Another caller may have filled the cache while this work was queued.
+        const cached = getCache(cacheKey);
+        if (cached) return JSON.parse(cached);
+        return loadChapter(chapterId, undefined, ttl, true);
+      });
+  let servedStale = false;
+  const result = opts?.forceLive
+    ? await loadChapter(chapterId, userId, ttl, false, true)
+    : await (isPreCaching ? fetchContent() : orStale(cacheKey, fetchContent, () => { servedStale = true; }));
+
+  if (!isPreCaching && userId) {
+    if (result.fictionId) deleteCache(fictionCacheKey(result.fictionId, userId));
+    deleteCache(`follows:${userId}`);
+  }
+
+  return servedStale ? Object.assign({}, result, { cacheStale: true }) : result;
+}
+
+async function loadChapter(
+  chapterId: number,
+  userId?: string,
+  ttl?: number,
+  retainStale = false,
+  background = false,
+): Promise<ChapterContent> {
+  const cacheKey = `chapter:${chapterId}`;
+  const isPreCaching = ttl !== undefined;
   const { page, content, release } = await getPage(
     `${ROYAL_ROAD_BASE_URL}/fiction/0/chapter/${chapterId}`,
     ".chapter-content",
     userId,
-    { allowAnonymous: true },
+    { allowAnonymous: !userId, background: isPreCaching || background },
   );
 
-  // Royal Road records a chapter as read from a short-lived AJAX call fired
-  // once the page has loaded, so on the browser path give it a moment before
-  // tearing the page down. Skipped when pre-caching: marking a chapter read
-  // because the warmer visited it would be wrong.
-  if (page && !isPreCaching) {
-    await page.waitForTimeout(2000);
+  // Give authenticated visits time to settle before closing the page.
+  // Speculative visits remain anonymous and do not update reading progress.
+  try {
+    if (page && userId && !isPreCaching) await page.waitForTimeout(2000);
+  } finally {
+    await release();
   }
-  await release();
 
   assertHasContent("chapter content", content, CONTENT_PROBE.chapter);
 
@@ -1296,10 +1407,6 @@ export async function getChapter(
   const prevChapterUrl = navInfo.prevUrl ? navInfo.prevUrl.replace(/.*\/chapter\/(\d+).*/, "/chapter/$1") : undefined;
   const nextChapterUrl = navInfo.nextUrl ? navInfo.nextUrl.replace(/.*\/chapter\/(\d+).*/, "/chapter/$1") : undefined;
 
-  // Extract next chapter ID for pre-caching
-  const nextChapterIdMatch = nextChapterUrl?.match(/\/chapter\/(\d+)/);
-  const nextChapterId = nextChapterIdMatch ? parseInt(nextChapterIdMatch[1], 10) : undefined;
-
   const result: ChapterContent = {
     id: chapterId,
     fictionId: fictionInfo.fictionId,
@@ -1311,32 +1418,22 @@ export async function getChapter(
     fictionUrl: `/fiction/${fictionInfo.fictionId}`,
   };
 
-  setCache(cacheKey, JSON.stringify(result), ttl ?? CHAPTER_CACHE_TTL);
-
-  if (!isPreCaching && userId) {
-    // Invalidate this user's fiction row so the fiction page shows fresh
-    // read/continue state. Scoped by prefix: only this fiction, only this user.
+  const serialized = JSON.stringify(result);
+  if (retainStale) {
+    setCacheWithStale(cacheKey, serialized, ttl ?? CHAPTER_CACHE_TTL);
     if (fictionInfo.fictionId) {
-      const staleFictionKey = fictionCacheKey(fictionInfo.fictionId, userId);
-      if (deleteCache(staleFictionKey)) {
-        console.log(`Invalidated fiction cache: ${staleFictionKey}`);
-      }
+      const metadataKey = `chapter-meta:royalroad:${fictionInfo.fictionId}:${chapterId}`;
+      setCache(metadataKey, JSON.stringify({
+        source: "royalroad",
+        fictionRef: String(fictionInfo.fictionId),
+        fictionTitle: fictionInfo.fictionTitle || "",
+        chapterRef: String(chapterId),
+        cacheKey,
+        lastAccessedAt: 0,
+      }), Math.max(STALE_TTL, ttl ?? CHAPTER_CACHE_TTL));
     }
-    const followsCacheKey = `follows:${userId}`;
-    if (deleteCache(followsCacheKey)) {
-      console.log(`Invalidated follows cache`);
-    }
-  }
-
-  if (nextChapterId && !isPreCaching) {
-    console.log(`Pre-caching next chapter: ${nextChapterId}`);
-    // Serialised: the warmer shares the anonymous browser context with live
-    // reads, and concurrent pages on it stall behind each other's navigations.
-    preCacheChain = preCacheChain
-      .then(async () => {
-        await getChapter(nextChapterId, userId, CHAPTER_CACHE_TTL);
-      })
-      .catch((e) => console.error(`Failed to pre-cache chapter ${nextChapterId}:`, e));
+  } else {
+    setCache(cacheKey, serialized, ttl ?? CHAPTER_CACHE_TTL);
   }
 
   return result;

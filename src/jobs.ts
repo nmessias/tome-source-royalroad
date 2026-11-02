@@ -35,6 +35,7 @@ async function getScraperFunctions() {
     getToplist: scraper.getToplist,
     getChapter: scraper.getChapter,
     getFiction: scraper.getFiction,
+    isFictionCached: scraper.isFictionCached,
   };
 }
 
@@ -63,7 +64,7 @@ async function warmFollowsCache(): Promise<void> {
   console.log("[Job] Warming follows cache...");
   
   try {
-    const { getFollows, getChapter, getFiction } = await getScraperFunctions();
+    const { getFollows, getChapter, getFiction, isFictionCached } = await getScraperFunctions();
     
     if (isCached(`follows:${adminUserId}`)) {
       console.log("[Job] Follows list already cached, skipping fetch");
@@ -92,12 +93,8 @@ async function warmFollowsCache(): Promise<void> {
         break;
       }
       try {
-        // Must match the key the scraper writes (fiction:<id>:<user>); a bare
-        // `fiction:<id>` never hits, so every cycle re-fetched all 50 followed
-        // fictions - hundreds of browser requests an hour, which got the exit
-        // node's IP challenged by Cloudflare and kept the single vCPU busy.
-        const fictionCacheKey = `fiction:${fiction.id}:${adminUserId}`;
-        if (!isCached(fictionCacheKey)) {
+        // Share the scraper's key selection so cached pages are not re-fetched.
+        if (!isFictionCached(fiction.id, adminUserId)) {
           warms++;
           const fictionDetails = await getFiction(fiction.id, adminUserId, CACHE_TTL.FICTION);
           if (!fictionDetails?.chapters?.length) continue;
