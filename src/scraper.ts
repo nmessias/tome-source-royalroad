@@ -1097,52 +1097,14 @@ async function getFollowsLive(userId: string, ttl: number): Promise<FollowedFict
 
     // Carry the unresolved redirect target alongside each row so the resolver
     // below can find it without a second parse.
-    const fictions = cards.map((card) => ({
-      ...toFollowedFiction(card),
-      ...(card.nextChapterResolveUrl ? { __resolveUrl: card.nextChapterResolveUrl } : {}),
-    })) as (FollowedFiction & { __resolveUrl?: string })[];
+    const fictions = cards.map(toFollowedFiction);
 
-    // Resolve /chapter/next/ redirect URLs to get actual chapter IDs. These run
-    // inside the follows page we already have open: no extra navigations.
-    const needing = fictions.filter((f) => !!f.__resolveUrl && !f.nextChapterId);
-
-    if (needing.length > 0) {
-      if (!page) {
-        console.warn(`Cannot resolve ${needing.length} next chapter URLs without a browser page`);
-      } else {
-        const startTime = Date.now();
-        console.log(`Resolving ${needing.length} next chapter redirect URLs...`);
-        const resolved = await resolveRedirects(
-          page,
-          needing.map((f) => f.__resolveUrl!)
-        );
-        console.log(
-          `Resolved ${resolved.size}/${needing.length} redirect URLs in ${Date.now() - startTime}ms`
-        );
-
-        for (const fiction of needing) {
-          const resolve = fiction.__resolveUrl;
-          if (!resolve) continue;
-
-          const finalUrl = resolved.get(resolve);
-          const chapterId = finalUrl ? finalUrl.match(/\/chapter\/(\d+)/)?.[1] : undefined;
-
-          // The redirect target must be a chapter *other than* the fiction id
-          // that was in the /chapter/next/<id> path. Anything else means the
-          // redirect never resolved (challenge, 405, ...) and the id we read is
-          // the fiction's own, which would link to a chapter that does not exist.
-          const requestedFictionId = resolve.match(/\/chapter\/next\/(\d+)/)?.[1];
-          if (chapterId && chapterId !== requestedFictionId) {
-            fiction.nextChapterId = parseInt(chapterId, 10);
-          } else if (chapterId) {
-            console.warn(
-              `[Scraper] Next-chapter redirect for "${fiction.title}" did not resolve ` +
-              `(got ${chapterId}, same as the fiction id) - leaving the read link unset`
-            );
-          }
-        }
-      }
-    }
+    // /chapter/next/<id> can only be resolved by a real page load and Royal Road
+    // challenges that endpoint, so resolving it here cost 43 challenged
+    // navigations per follows warm. Skip it: nextChapterId stays set only when
+    // the follows page already links to a concrete chapter (the common case for
+    // fictions with reading progress). The job still prefetches the next chapter
+    // from the fiction page, so reading itself is unaffected.
 
     if (fictions.length > 0) {
       setCacheWithStale(cacheKey, JSON.stringify(fictions), ttl);
