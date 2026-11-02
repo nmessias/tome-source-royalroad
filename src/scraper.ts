@@ -993,109 +993,40 @@ async function pageIsLoginShell(page: Page): Promise<boolean> {
   }
 }
 
-/**
- * Resolve `/chapter/next/<fictionId>` redirects without rendering a page.
- *
- * Each of these is a 302 to the actual next chapter, so all we need is the
- * target URL. Two cheap transports, in order:
- *
- * 1. The context's request client. It shares the browser's cookies and runs
- *    through Chromium's network stack, and with `maxRedirects: 0` it hands back
- *    the `Location` header directly - one small request, no body, no DOM.
- * 2. An in-page `fetch()` on the page that is already open, as a fallback when
- *    the request client is refused. Also no DOM, no scripts, no subresources.
- *
- * Navigating a page per URL - the old behaviour - meant loading 40-odd full
- * chapter pages every time the follows cache was warmed.
- *
- * Returns a map of requested URL -> final URL. Unresolved URLs are omitted.
- */
 async function resolveRedirects(page: Page, urls: string[]): Promise<Map<string, string>> {
   if (urls.length === 0) return new Map();
-
+  await ensureBrowser();
+  const ctx = page.context();
   const out = new Map<string, string>();
-  const failures: string[] = [];
-  await mapLimit(urls, 8, async (url) => {
+
+  await mapLimit(urls, MAX_CONCURRENT_BROWSER_FETCHES, async (url) => {
+    // Each redirect is a 302 to the actual next chapter, so `commit` (first byte
+    // of the response) is all we need: `page.url()` is already the final URL and
+    // no body is downloaded or rendered. A full `getPage` here used to load 43
+    // chapter pages per follows warm.
+    const releaseSlot = await browserSlots.acquire();
+    let p: Page | null = null;
     try {
-      const res = await page.context().request.get(url, {
-        maxRedirects: 0,
-        failOnStatusCode: false,
-        timeout: 15_000,
+      p = await ctx.newPage();
+      await p.route("**/*", (route) => {
+        if (route.request().resourceType() === "document") route.continue();
+        else route.abort();
       });
-      const status = res.status();
-      const location = res.headers()["location"];
-      if (status >= 300 && status < 400 && location) {
-        out.set(url, new URL(location, url).toString());
-      } else {
-        failures.push(`${status} ${url}`);
-      }
+      const navStart = Date.now();
+      await p.goto(url, { waitUntil: "commit", timeout: 30_000 });
+      const finalUrl = p.url();
+      console.log(`[Scraper] Resolved ${url} -> ${finalUrl} in ${Date.now() - navStart}ms`);
+      if (finalUrl && finalUrl !== url && finalUrl !== `${url}/`) out.set(url, finalUrl);
     } catch (e) {
-      failures.push(`throw ${(e as Error).message.slice(0, 60)} ${url}`);
+      console.warn(`[Scraper] Failed to resolve ${url}: ${(e as Error).message.slice(0, 80)}`);
+    } finally {
+      try { await p?.close(); } catch {}
+      releaseSlot();
     }
   });
 
-  if (out.size > 0) {
-    if (failures.length > 0) {
-      console.warn(`[Scraper] ${failures.length}/${urls.length} next-chapter redirects failed: ${failures.slice(0, 3).join(", ")}`);
-    }
-    return out;
-  }
-
-  console.warn(
-    `[Scraper] Request client resolved 0/${urls.length} next-chapter redirects (${failures.slice(0, 2).join(", ")}); trying in-page fetch`
-  );
-  return resolveRedirectsInPage(page, urls, 4);
+  return out;
 }
-async function resolveRedirectsInPage(
-  page: Page,
-  urls: string[],
-  concurrency: number = 6
-): Promise<Map<string, string>> {
-  if (urls.length === 0) return new Map();
-  const result = await page.evaluate(
-    async ({ urls, concurrency }) => {
-      const out: [string, string][] = [];
-      const failed: { url: string; status: number; type: string; finalUrl: string }[] = [];
-      let next = 0;
-      const worker = async () => {
-        while (next < urls.length) {
-          const url = urls[next++];
-          try {
-            const res = await fetch(url, {
-              redirect: "follow",
-              credentials: "include",
-              cache: "no-store",
-            });
-            // `res.url` is the final URL after the redirect chain; an opaque
-            // redirect or a rejection leaves it equal to the request. The body
-            // is not needed, so drop it instead of downloading a whole chapter
-            // per URL.
-            const finalUrl = res.url;
-            const ok = res.ok;
-            if (!ok) failed.push({ url, status: res.status, type: res.type, finalUrl });
-            res.body?.cancel().catch(() => {});
-            if (ok && finalUrl && finalUrl !== url) out.push([url, finalUrl]);
-          } catch (e) {
-            failed.push({ url, status: 0, type: "throw", finalUrl: String((e as Error)?.message).slice(0, 80) });
-          }
-        }
-      };
-      await Promise.all(
-        Array.from({ length: Math.min(concurrency, urls.length) }, worker)
-      );
-      return { out, failed };
-    },
-    { urls, concurrency }
-  );
-  if (result.failed.length > 0) {
-    console.warn(
-      `[Scraper] ${result.failed.length}/${urls.length} next-chapter redirects failed in-page. ` +
-      `Sample: ${JSON.stringify(result.failed.slice(0, 3))}`
-    );
-  }
-  return new Map(result.out);
-}
-
 export async function closeBrowser(): Promise<void> {
   if (!ENABLE_BROWSER) return;
 
