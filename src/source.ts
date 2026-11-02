@@ -26,9 +26,8 @@ import {
   clearRoyalRoadCookies,
   clearSessionState,
 } from "./royalroad-credentials";
-import { performAutoLogin, ROYAL_ROAD_AUTO_LOGIN_ENABLED } from "./royalroad-auth";
+import { ROYAL_ROAD_AUTO_LOGIN_ENABLED, ENABLE_BROWSER } from "./config";
 import { performBrowserLogin } from "./scraper";
-import { ENABLE_BROWSER } from "./config";
 import { triggerCacheWarm } from "./jobs";
 import { clearCache } from "tome";
 
@@ -175,12 +174,9 @@ export const royalroadSource: Source = {
   autoLogin: {
     enabled: ROYAL_ROAD_AUTO_LOGIN_ENABLED,
     async refresh(userId) {
-      // Try the Chrome-impersonating HTTP login first; fall back to the browser
-      // for a JS challenge. `force` skips the automatic attempt backoff: this
-      // is the user pressing the button, not a background retry storm.
-      const ok =
-        (await performAutoLogin(userId)) ||
-        (ENABLE_BROWSER ? await performBrowserLogin(userId, { force: true }) : false);
+      // `force` skips the automatic attempt backoff: this is the user pressing
+      // the button, not a background retry storm.
+      const ok = ENABLE_BROWSER ? await performBrowserLogin(userId, { force: true }) : false;
       if (!ok) return false;
       clearSessionState(userId);
       await createContext(userId, { force: true });

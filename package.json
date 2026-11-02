@@ -29,7 +29,6 @@
     "fixtures": "bun run test/build-fixtures.ts"
   },
   "dependencies": {
-    "impit": "^0.14.7",
     "linkedom": "^0.16.0",
     "tome": "github:nmessias/tome#810ca18a985e57bdf4ca35cab3314dde9706c303"
   },

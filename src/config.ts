@@ -6,24 +6,29 @@ import type { ToplistType } from "tome";
 // Browser/Playwright (disabled by default for smaller image, set ENABLE_BROWSER=true to enable)
 export const ENABLE_BROWSER = process.env.ENABLE_BROWSER === "true";
 
-// Which Playwright engine to drive. Chromium is the default because Cloudflare
-// treats it far more leniently: it rejects the Royal Road login POST outright
-// when the browser is Firefox (or when Chromium runs headless), which breaks
-// auto-login.
+// Which Playwright engine to drive. Chromium is the only supported engine: it is
+// the one Cloudflare's passive checks accept.
 export const BROWSER_ENGINE = (process.env.ROYAL_ROAD_BROWSER || "chromium") as "chromium" | "firefox";
 
-// Headless is detected by Cloudflare (the login page never renders), so the
-// default is a real browser window. In a container that means running Xvfb and
-// pointing DISPLAY at it - see scripts/start.sh in the Tome repo.
-export const BROWSER_HEADLESS = process.env.ROYAL_ROAD_HEADLESS === "true";
+// Headless by default: no Xvfb, no window, ~100MB less memory. Cloudflare does
+// not care about headless per se - it rejects the `HeadlessChrome/...` token in
+// the User-Agent. initBrowser() therefore launches with the real Chrome version
+// in the UA (see chromeUserAgent), which passes. Set ROYAL_ROAD_HEADLESS=false
+// only when debugging locally with a display.
+export const BROWSER_HEADLESS = process.env.ROYAL_ROAD_HEADLESS !== "false";
+
+// Optional User-Agent override. Empty means "derive it from the Chromium build
+// that is actually installed" - a UA that claims a different version than the
+// binary is itself a fingerprint mismatch.
+export const BROWSER_USER_AGENT = process.env.ROYAL_ROAD_USER_AGENT || "";
 
 // Egress proxy for the Royal Road scraper (ROYAL_ROAD_PROXY), e.g.
-// http://user:pass@host:3128 or socks5://127.0.0.1:1055.
+// https://user:pass@host:3128 or socks5://127.0.0.1:1055.
 //
-// Optional. The primary HTTP path impersonates Chrome and normally goes direct;
-// this is a manual escape hatch for when a proxy is needed. If set, it is used
-// by both impit and the Playwright fallback. cf_clearance is bound to the exit
-// IP, so the proxy needs a stable one. Chromium cannot do SOCKS5 with
+// Optional, but effectively required in production: Royal Road's Cloudflare
+// rules challenge every request from Fly's datacenter ranges, and no header or
+// TLS tweak gets past that. Routing through a residential/mobile exit node is
+// what makes the browser look like a real user. Chromium cannot do SOCKS5 with
 // credentials - use an http:// proxy for those.
 export function parseProxy(raw: string): { server: string; username?: string; password?: string } | undefined {
   if (!raw) return undefined;

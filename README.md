@@ -24,10 +24,10 @@ Requires Tome >= 1.5.0.
 | Env var | Purpose |
 |---|---|
 | `ROYAL_ROAD_USERNAME` / `ROYAL_ROAD_PASSWORD` | Auto-login when the session expires (optional) |
-| `ENABLE_BROWSER=true` | Use Playwright (Chromium) for scraping (optional, heavier image) |
-| `ROYAL_ROAD_BROWSER` | `chromium` (default) or `firefox`. Chromium logs in reliably; Firefox cannot get past Cloudflare's login check. |
-| `ROYAL_ROAD_HEADLESS` | `true` to run headless. Leave unset in production — Cloudflare rejects the login POST from a headless browser. |
-| `ROYAL_ROAD_PROXY` | Optional proxy URL used by both the HTTP client and the browser, e.g. `http://user:pass@host:3128` or `socks5://127.0.0.1:1055`. Leave unset for the normal direct path. The exit IP must be stable because `cf_clearance` is IP-bound. |
+| `ENABLE_BROWSER=true` | Use Playwright (Chromium) for scraping. Required: the browser is the only transport Cloudflare accepts. |
+| `ROYAL_ROAD_BROWSER` | Only `chromium` is supported. |
+| `ROYAL_ROAD_HEADLESS` | Headless by default. Set `false` only for local debugging with a display. |
+| `ROYAL_ROAD_PROXY` | Optional proxy URL used by the browser, e.g. `http://user:pass@host:3128` or `socks5://127.0.0.1:1055`. Required in production: Cloudflare challenges every request from datacenter IPs, so the exit node must be residential/mobile. Chromium cannot do SOCKS5 with credentials. |
 | `ROYAL_ROAD_CHAPTER_TTL_DAYS` | Chapter cache lifetime in days (default `7`). |
 | `ROYAL_ROAD_LOGIN_COOLDOWN_MS` | Backoff after a failed automatic login (default 5 min). The Settings > Refresh session button always skips it. |
 
@@ -35,16 +35,19 @@ Session cookies (`.AspNetCore.Identity.Application`, `cf_clearance`) can also be
 
 ### Fetching and Cloudflare
 
-The primary path is [`impit`](https://github.com/apify/impit) with its generic
-`chrome` profile: it reproduces Chrome's TLS and HTTP/2 fingerprint, which is
-what Cloudflare checks on Royal Road's HTML pages. A stored
-`.AspNetCore.Identity.Application` cookie is sent with the request; a stored
-`cf_clearance` is deliberately **not** sent, because it is bound to the IP and
-browser that earned it and a stale one makes the request look forged.
+There is no HTTP fast path. `impit` (a Chrome-TLS-impersonating client) used to
+serve most pages, but Royal Road's Cloudflare now answers it with a managed JS
+challenge regardless of the User-Agent, so it was removed.
 
-Playwright is the fallback for a JavaScript challenge or an interactive login.
-It is optional (`ENABLE_BROWSER=true` turns it on), and `ROYAL_ROAD_PROXY` is an
-optional escape hatch — neither is required for the direct HTTP path.
+The browser is the transport. It runs **headless** and is kept warm, so only the
+first fetch pays start-up. The one non-obvious detail: headless Chrome advertises
+`HeadlessChrome/<version>` in its User-Agent, and Cloudflare rejects that token
+with a challenge that never clears. The plugin therefore launches Chromium with
+`--user-agent=<real Chrome version>`, derived from the installed binary. That,
+plus a residential/mobile exit IP (`ROYAL_ROAD_PROXY`), is what gets through.
+
+A stored `cf_clearance` is deliberately **not** sent: it is bound to the IP and
+browser that earned it, and a stale one makes the request look forged.
 
 ### A note on the two front ends
 
