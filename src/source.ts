@@ -13,6 +13,7 @@ import {
   getReadLater,
   getToplist,
   getToplistCached,
+  getFollowsCached,
   getFiction,
   getChapter,
   validateCookies,
@@ -106,6 +107,9 @@ export const royalroadSource: Source = {
   },
   getToplist(toplist, userId, ttl) {
     return getToplist(toplist, userId, ttl);
+  },
+  getFollowsCached(userId) {
+    return getFollowsCached(userId);
   },
   getToplistCached(toplist) {
     return getToplistCached(toplist);

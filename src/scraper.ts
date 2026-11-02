@@ -1119,6 +1119,13 @@ async function getFollowsLive(userId: string, ttl: number): Promise<FollowedFict
   }
 }
 
+/** Follows from cache only, fresh or the last good copy; never scrapes. */
+export function getFollowsCached(userId: string): FollowedFiction[] | null {
+  const key = `follows:${userId}`;
+  const cached = getCache(key) ?? getCache(staleKey(key));
+  return cached ? JSON.parse(cached) : null;
+}
+
 export async function getHistory(userId: string): Promise<HistoryEntry[]> {
   const { content, release } = await getPage(
     `${ROYAL_ROAD_BASE_URL}/my/history`,
