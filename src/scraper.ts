@@ -1,11 +1,10 @@
 /**
- * Playwright scraper for Royal Road.
+ * Royal Road scraper.
  *
- * There is deliberately no HTTP fast path. A TLS-impersonating client (impit)
- * used to serve most pages, but Royal Road's Cloudflare now serves it a managed
- * JS challenge no matter the User-Agent, so the browser is the only transport
- * that works. It runs headless with the real Chrome version in the UA and is
- * kept warm: the first fetch pays browser start-up, later ones do not.
+ * Pages are fetched over HTTP with a browser-impersonating client (./http).
+ * Headless Chromium is an optional fallback (ENABLE_BROWSER=true) for the one
+ * thing HTTP cannot do: sit through a Cloudflare JS challenge. It runs with
+ * the real Chrome version in the UA and closes itself when idle.
  *
  * All HTML parsing lives in ./parsers so it stays pure and testable.
  */
@@ -14,6 +13,7 @@ import { execFileSync } from "node:child_process";
 import { getCache, setCache, deleteCache, isCached } from "tome";
 import { CACHE_TTL } from "tome";
 import {
+  getRoyalRoadCookies,
   getRoyalRoadCookiesForPlaywright,
   hasRoyalRoadSession,
   setRoyalRoadCookie,
@@ -31,6 +31,8 @@ import { useAuthenticatedContext } from "./context-selection";
 import { FICTION_CONTENT_PROBE, FICTION_READY_SELECTOR } from "./fiction-readiness";
 import { fictionCacheKey as makeFictionCacheKey } from "./fiction-cache-key";
 import { readSavedFiction } from "./fiction-fallback";
+import { classifyResponse, cookieHeaderFor, fetchRoyalRoad } from "./http";
+import { performHttpLogin } from "./royalroad-auth";
 import {
   ROYAL_ROAD_BASE_URL,
   ROYAL_ROAD_USERNAME,
@@ -401,10 +403,9 @@ export async function createContext(
   userId: string,
   opts: { force?: boolean } = {},
 ): Promise<BrowserContext | null> {
-  if (!ENABLE_BROWSER || !browser) {
-    if (ENABLE_BROWSER) await initBrowser();
-    return null;
-  }
+  // Not running means nothing to refresh: the next launch loads the stored
+  // cookies. Launching here would start a browser no lease will ever close.
+  if (!ENABLE_BROWSER || !browser) return null;
 
   // Keep the context (and the Cloudflare clearance it earned) for the same
   // user. Recreating it on every request forced a fresh JS challenge on every
@@ -485,13 +486,34 @@ async function createAnonContext(): Promise<void> {
 
 // ============ Auto-login ============
 
-let lastBrowserLoginAttempt = 0;
-// Cloudflare challenges the login POST and, when it does not clear, the whole
-// browser session stays challenged afterwards (even /home times out). Retrying
-// on every login redirect therefore makes things worse, so background attempts
-// back off. An explicit user action (Settings > Refresh session) passes
-// `force` and skips the backoff entirely.
-export function performBrowserLogin(userId: string, opts: { force?: boolean } = {}): Promise<boolean> {
+let lastLoginAttempt = 0;
+
+/**
+ * Log in with the configured credentials: over HTTP, then in the browser when
+ * it is enabled.
+ *
+ * Cloudflare challenges the login POST and, when it does not clear, the whole
+ * session stays challenged afterwards (even /home times out). Retrying on every
+ * login redirect therefore makes things worse, so background attempts back
+ * off. An explicit user action (Settings > Refresh session) passes `force` and
+ * skips the backoff entirely.
+ */
+export async function performLogin(userId: string, opts: { force?: boolean } = {}): Promise<boolean> {
+  if (!ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
+    console.error("[AutoLogin] ROYAL_ROAD_USERNAME / ROYAL_ROAD_PASSWORD are not configured");
+    return false;
+  }
+  if (!opts.force && Date.now() - lastLoginAttempt < AUTO_LOGIN_COOLDOWN_MS) {
+    console.warn("[AutoLogin] Skipping login (attempted recently). A fresh session cookie in Settings is the reliable path.");
+    return false;
+  }
+  lastLoginAttempt = Date.now();
+  const ok = (await performHttpLogin(userId)) || (ENABLE_BROWSER && (await performBrowserLogin(userId, { force: true })));
+  if (ok) clearSessionState(userId);
+  return ok;
+}
+
+function performBrowserLogin(userId: string, opts: { force?: boolean } = {}): Promise<boolean> {
   return leased(() => browserLogin(userId, opts));
 }
 
@@ -504,14 +526,14 @@ async function browserLogin(userId: string, opts: { force?: boolean }): Promise<
     console.error("[AutoLogin] ROYAL_ROAD_USERNAME / ROYAL_ROAD_PASSWORD are not configured");
     return false;
   }
-  if (!opts.force && Date.now() - lastBrowserLoginAttempt < AUTO_LOGIN_COOLDOWN_MS) {
+  if (!opts.force && Date.now() - lastLoginAttempt < AUTO_LOGIN_COOLDOWN_MS) {
     console.warn(
       "[AutoLogin] Skipping browser login (attempted recently). " +
       "A fresh session cookie in Settings is the reliable path."
     );
     return false;
   }
-  lastBrowserLoginAttempt = Date.now();
+  lastLoginAttempt = Date.now();
 
   await ensureBrowser();
   if (!browser) {
@@ -773,13 +795,22 @@ async function waitForChallengeToClear(page: Page, url: string, waitMs: number =
 
 type PageResult = { page: Page | null; content: string; authenticated: boolean; release: () => Promise<void> };
 
-/** The browser stays open from the call until the caller's `release()`. */
+/**
+ * Fetch a Royal Road page over HTTP, falling back to the browser (when
+ * enabled) for a Cloudflare challenge. A browser page stays open, and the
+ * browser running, until the caller's `release()`.
+ */
 export async function getPage(
   url: string,
   waitForSelector?: string,
   userId?: string,
   opts: GetPageOptions = {}
 ): Promise<PageResult> {
+  const viaHttp = await getPageHttp(url, userId, opts);
+  if (viaHttp) return viaHttp;
+  if (!ENABLE_BROWSER) {
+    throw new Error(`Cloudflare challenged ${url} and the browser fallback is off (ENABLE_BROWSER=false)`);
+  }
   const releaseLease = browserLease.acquire();
   try {
     const result = await getPageLeased(url, waitForSelector, userId, opts);
@@ -788,6 +819,82 @@ export async function getPage(
     releaseLease();
     throw error;
   }
+}
+
+/** Royal Road's session (.AspNetCore.Identity.Application) and antiforgery cookies. */
+const SESSION_COOKIE = /^\.AspNetCore\./;
+
+/**
+ * The HTTP attempt. Returns null when only a browser could get further (a
+ * Cloudflare challenge, or a transport error with the browser enabled).
+ */
+async function getPageHttp(url: string, userId: string | undefined, opts: GetPageOptions): Promise<PageResult | null> {
+  const startTime = Date.now();
+  const allowAnonymous = opts.allowAnonymous === true;
+
+  if (userId && !hasRoyalRoadSession(userId) && !allowAnonymous) {
+    if (!ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
+      throw new Error("Session cookies not configured. Please set up your Royal Road cookies first.");
+    }
+    console.log("[Scraper] No session found, attempting auto-login...");
+    if (!(await performLogin(userId))) {
+      throw new Error("Auto-login failed. Please configure your Royal Road session manually.");
+    }
+  }
+
+  const wantAuth = !!userId && useAuthenticatedContext(userId, hasRoyalRoadSession(userId), allowAnonymous, isSessionKnownDead(userId));
+  console.log(`[Scraper] Fetching ${url} (${wantAuth ? "auth" : "anon"}, http)`);
+
+  const releaseSlot = await browserSlots.acquire(opts.background, opts.signal);
+  let res: Awaited<ReturnType<typeof fetchRoyalRoad>>;
+  let html: string;
+  try {
+    res = await fetchRoyalRoad(url, wantAuth ? { headers: { Cookie: cookieHeaderFor(getRoyalRoadCookies(userId!)) } } : undefined);
+    html = await res.text();
+  } catch (error) {
+    if (!ENABLE_BROWSER) throw error;
+    console.warn(`[Scraper] HTTP fetch of ${url} failed (${(error as Error).name}), trying the browser`);
+    return null;
+  } finally {
+    releaseSlot();
+  }
+
+  // Keep the session sliding and the antiforgery cookie paired with the tokens
+  // in pages we cache (bookmark POSTs need both).
+  if (wantAuth) {
+    for (const pair of res.headers.getSetCookie().map((c) => c.split(";")[0])) {
+      const eq = pair.indexOf("=");
+      const [name, value] = [pair.slice(0, eq), pair.slice(eq + 1)];
+      if (SESSION_COOKIE.test(name) && value) setRoyalRoadCookie(userId!, name, value);
+    }
+  }
+
+  const verdict = classifyResponse(
+    { status: res.status, html, finalUrl: res.url, cfMitigated: res.headers.get("cf-mitigated") },
+    wantAuth,
+  );
+  if (verdict === "challenge") {
+    console.log(`[Scraper] Cloudflare challenge on ${url} (http, ${Date.now() - startTime}ms)`);
+    return null;
+  }
+  if (verdict === "error") throw new Error(`Royal Road answered HTTP ${res.status} for ${url}`);
+  if (verdict === "login" && wantAuth) {
+    markSessionDead(userId!);
+    console.warn(`[Scraper] ${url} came back logged out - the stored session was rejected`);
+    if (!opts.alreadyRetriedWithLogin && ROYAL_ROAD_AUTO_LOGIN_ENABLED && (await performLogin(userId!))) {
+      return getPageHttp(url, userId, { ...opts, alreadyRetriedWithLogin: true });
+    }
+    // With the session marked dead, a public page retries anonymously.
+    if (allowAnonymous) return getPageHttp(url, userId, { ...opts, alreadyRetriedWithLogin: true });
+    throw new Error(
+      "Royal Road rejected the stored session. " +
+      "Paste a fresh .AspNetCore.Identity.Application cookie in Settings > Royal Road."
+    );
+  }
+
+  if (wantAuth) clearSessionState(userId!);
+  console.log(`[Scraper] HTTP page fetched in ${Date.now() - startTime}ms (${res.status}, ${html.length} bytes)`);
+  return { page: null, content: html, authenticated: wantAuth, release: async () => {} };
 }
 
 async function getPageLeased(
@@ -806,7 +913,7 @@ async function getPageLeased(
       if (!ENABLE_BROWSER) {
         throw new Error("Auto-login needs the browser (ENABLE_BROWSER=true).");
       }
-      if (!(await performBrowserLogin(userId))) {
+      if (!(await performLogin(userId))) {
         throw new Error("Auto-login failed. Please configure your Royal Road session manually.");
       }
       hasSession = hasRoyalRoadSession(userId);
@@ -982,7 +1089,7 @@ async function getPageLeased(
           markSessionDead(userId);
           await page.close();
           console.log("[Scraper] Attempting auto-login before retry...");
-          const loggedIn = await performBrowserLogin(userId);
+          const loggedIn = await performLogin(userId);
           // Always rebuild the page: it was just closed above, so retrying on
           // it fails with "Target page, context or browser has been closed".
           if (!loggedIn) {
@@ -1516,7 +1623,7 @@ export async function validateCookies(userId: string): Promise<boolean> {
       markSessionDead(userId);
       if (ROYAL_ROAD_AUTO_LOGIN_ENABLED) {
         console.log("[Scraper] Cookie validation failed, attempting auto-login...");
-        const loggedIn = await performBrowserLogin(userId);
+        const loggedIn = await performLogin(userId);
         if (loggedIn) {
           clearSessionState(userId);
           await createContext(userId, { force: true });
@@ -1576,29 +1683,37 @@ export async function setBookmark(
   csrfToken: string
 ): Promise<{ success: boolean; error?: string }> {
   const url = `${ROYAL_ROAD_BASE_URL}/fictions/setbookmark/${fictionId}`;
-  const releaseLease = browserLease.acquire();
+  const form = { type, mark: mark ? "True" : "False", __RequestVerificationToken: csrfToken };
 
   try {
     console.log(`[Scraper] Setting bookmark: fiction=${fictionId}, type=${type}, mark=${mark}`);
 
-    // The context's request client shares the browser's cookie jar, so this POST
-    // carries the same session (and network path) as a page visit. A plain
-    // server-side fetch cannot: Cloudflare blocks non-browser clients outright.
-    // The browser may have been closed while idle.
-    await ensureBrowser();
-    const ctx = await createContext(userId);
-    if (!ctx) throw new Error("No browser context available for bookmark");
-
-    const response = await ctx.request.post(url, {
-      form: {
-        type,
-        mark: mark ? "True" : "False",
-        __RequestVerificationToken: csrfToken,
+    // The token pairs with the antiforgery cookie getPageHttp stored with the
+    // session. A 302 is success, not something to follow.
+    const res = await fetchRoyalRoad(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: cookieHeaderFor(getRoyalRoadCookies(userId)),
+        Referer: `${ROYAL_ROAD_BASE_URL}/fiction/${fictionId}`,
       },
-      maxRedirects: 0,  // A 302 is success, not something to follow
-      failOnStatusCode: false,
+      body: new URLSearchParams(form).toString(),
+      redirect: "manual",
     });
-    const status = response.status();
+    let status = res.status;
+
+    if (res.headers.get("cf-mitigated") === "challenge") {
+      if (!ENABLE_BROWSER) return { success: false, error: "Cloudflare challenged the request. Try again later." };
+      // The browser context's request client shares its cookie jar (and any
+      // clearance it earned). It may have been closed while idle.
+      status = await leased(async () => {
+        await ensureBrowser();
+        const ctx = await createContext(userId);
+        if (!ctx) throw new Error("No browser context available for bookmark");
+        const response = await ctx.request.post(url, { form, maxRedirects: 0, failOnStatusCode: false });
+        return response.status();
+      });
+    }
 
     // Success is typically 200 or 302 redirect
     if (status >= 200 && status < 400) {
@@ -1628,7 +1743,5 @@ export async function setBookmark(
   } catch (error) {
     console.error(`[Scraper] Bookmark error:`, error);
     return { success: false, error: "Network error" };
-  } finally {
-    releaseLease();
   }
 }

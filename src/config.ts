@@ -72,7 +72,13 @@ export function isThirdParty(requestUrl: string): boolean {
  * visible, and a removed fiction must not be resurrected.
  */
 export function isUnreachable(e: unknown): boolean {
-  return /net::ERR_|Timeout \d+ms|Cloudflare/i.test(String((e as Error)?.message));
+  const err = e as Error | undefined;
+  // Browser errors carry net::ERR_ / "Timeout Nms"; impit's transport errors
+  // are named classes (ConnectError, ReadTimeout, ProxyError, ...).
+  return (
+    /net::ERR_|Timeout \d+ms|Cloudflare/i.test(String(err?.message)) ||
+    /^(Network|Connect|Read|Write|Close|Proxy|ProxyTunnel|Transport|RemoteProtocol|Timeout)Error$|Timeout$/.test(String(err?.name))
+  );
 }
 
 // Royal Road

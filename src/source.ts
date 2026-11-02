@@ -29,8 +29,8 @@ import {
   clearRoyalRoadCookies,
   clearSessionState,
 } from "./royalroad-credentials";
-import { ROYAL_ROAD_AUTO_LOGIN_ENABLED, ENABLE_BROWSER } from "./config";
-import { performBrowserLogin } from "./scraper";
+import { ROYAL_ROAD_AUTO_LOGIN_ENABLED } from "./config";
+import { performLogin } from "./scraper";
 import { triggerCacheWarm } from "./jobs";
 import { clearCache } from "tome";
 import { SingleFlight } from "./single-flight";
@@ -189,7 +189,7 @@ export const royalroadSource: Source = {
     async refresh(userId) {
       // `force` skips the automatic attempt backoff: this is the user pressing
       // the button, not a background retry storm.
-      const ok = ENABLE_BROWSER ? await performBrowserLogin(userId, { force: true }) : false;
+      const ok = await performLogin(userId, { force: true });
       if (!ok) return false;
       clearSessionState(userId);
       await createContext(userId, { force: true });

@@ -9,6 +9,14 @@ describe("isUnreachable (what may be answered from a stale copy)", () => {
     expect(isUnreachable(new Error("page.goto: Timeout 60000ms exceeded."))).toBe(true);
   });
 
+  test("impit transport errors are unreachable", () => {
+    const named = (name: string) => Object.assign(new Error("Failed to connect to the server."), { name });
+    for (const name of ["ConnectError", "ReadTimeout", "ConnectTimeout", "TimeoutError", "ProxyError", "ProxyTunnelError"]) {
+      expect(isUnreachable(named(name))).toBe(true);
+    }
+    expect(isUnreachable(named("InvalidURL"))).toBe(false);
+  });
+
   test("Cloudflare blocks are unreachable", () => {
     expect(isUnreachable(new Error("Cloudflare would not let the browser through after several attempts."))).toBe(true);
     expect(isUnreachable(new Error("Cloudflare blocked the request for the fiction header"))).toBe(true);
