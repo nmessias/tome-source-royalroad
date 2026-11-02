@@ -369,13 +369,7 @@ async function launchBrowser(): Promise<void> {
         // belt-and-braces.
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
-        // 512MB of RAM total on the production box. One renderer shared by the
-        // (max 2) concurrent pages, no GPU process, and a hard cap on V8's heap
-        // keep the browser from pushing the machine into swap-less thrashing.
-        "--renderer-process-limit=1",
-        "--disable-site-isolation-trials",
         "--disable-gpu",
-        "--js-flags=--max-old-space-size=128",
         // Without this, headless Chrome advertises "HeadlessChrome/<version>"
         // and Cloudflare answers with a managed challenge that never clears.
         ...(browserUserAgent ? [`--user-agent=${browserUserAgent}`] : []),
