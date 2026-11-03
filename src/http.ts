@@ -14,7 +14,7 @@
  * while gru (~40ms) passed 10/10.
  */
 import { Impit, type ImpitOptions, type RequestInit } from "impit";
-import { SCRAPER_TIMEOUT } from "./config";
+import { SCRAPER_TIMEOUT, isUnreachable } from "./config";
 
 const SUPPORTED_PROXY_PROTOCOLS = new Set(["http:", "https:", "socks4:", "socks5:", "socks5h:"]);
 
@@ -72,17 +72,26 @@ export interface RoyalRoadResponse {
 }
 
 /**
- * The fetcher (fetcher/ in this repo) runs on the user's phone and makes the
- * request from Android's own network stack, which Cloudflare trusts more than
- * a request relayed through the phone's Tailscale exit node. Both variables
- * must be set to use it; otherwise requests go out directly (or via
- * ROYAL_ROAD_PROXY) with impit.
+ * The fetcher (fetcher/ in this repo) runs on a home machine (the user's
+ * desktop, their phone) and makes the request from that machine's own network
+ * stack, which Cloudflare trusts more than a request relayed through the
+ * phone's Tailscale exit node.
+ *
+ * ROYAL_ROAD_FETCHER_URL lists routes in order of preference, comma-separated:
+ * fetcher URLs, and "direct" for impit itself (via ROYAL_ROAD_PROXY). A route
+ * that is down or challenged falls through to the next; the last route's
+ * answer or error is final. Without both variables every request goes direct.
  */
-function fetcherConfig(): { url: string; token: string } | null {
-  const url = process.env.ROYAL_ROAD_FETCHER_URL?.trim();
+function fetcherConfig(): { routes: string[]; token: string } | null {
+  const routes = process.env.ROYAL_ROAD_FETCHER_URL?.split(",").map((r) => r.trim().replace(/\/+$/, "")).filter(Boolean);
   const token = process.env.ROYAL_ROAD_FETCHER_TOKEN?.trim();
-  return url && token ? { url: url.replace(/\/+$/, ""), token } : null;
+  return routes?.length && token ? { routes, token } : null;
 }
+
+/** A down fetcher (a sleeping desktop) is skipped for a while instead of costing every request a timeout. */
+const SKIP_DOWN_MS = 2 * 60_000;
+const FETCHER_TIMEOUT_MS = 35_000;
+const downUntil = new Map<string, number>();
 
 async function fetchViaFetcher(fetcher: { url: string; token: string }, url: string, init?: RequestInit): Promise<RoyalRoadResponse> {
   if (init?.body != null && typeof init.body !== "string") throw new Error("The Royal Road fetcher only supports string request bodies");
@@ -92,6 +101,8 @@ async function fetchViaFetcher(fetcher: { url: string; token: string }, url: str
   const res = await getClient().fetch(`${fetcher.url}/fetch`, {
     method: "POST",
     headers: { Authorization: `Bearer ${fetcher.token}`, "Content-Type": "application/json" },
+    // The fetcher gives up on Royal Road after 30s.
+    timeout: FETCHER_TIMEOUT_MS,
     body: JSON.stringify({
       url,
       method: init?.method,
@@ -116,9 +127,27 @@ async function fetchViaFetcher(fetcher: { url: string; token: string }, url: str
   return { status: out.status, url: out.url, headers, text: async () => out.body };
 }
 
-export function fetchRoyalRoad(url: string, init?: RequestInit): Promise<RoyalRoadResponse> {
-  const fetcher = fetcherConfig();
-  return fetcher ? fetchViaFetcher(fetcher, url, init) : getClient().fetch(url, init);
+export async function fetchRoyalRoad(url: string, init?: RequestInit): Promise<RoyalRoadResponse> {
+  const config = fetcherConfig();
+  if (!config) return getClient().fetch(url, init);
+  const up = config.routes.filter((route) => (downUntil.get(route) ?? 0) <= Date.now());
+  // Everything marked down: still try the last route rather than fail unasked.
+  const routes = up.length ? up : config.routes.slice(-1);
+  for (const [i, route] of routes.entries()) {
+    const last = i === routes.length - 1;
+    try {
+      const res = route === "direct"
+        ? await getClient().fetch(url, init)
+        : await fetchViaFetcher({ url: route, token: config.token }, url, init);
+      if (last || res.headers.get("cf-mitigated") !== "challenge") return res;
+      console.log(`[Scraper] ${route} was challenged; trying the next route`);
+    } catch (error) {
+      if (last || !isUnreachable(error)) throw error;
+      downUntil.set(route, Date.now() + SKIP_DOWN_MS);
+      console.warn(`[Scraper] ${route} is unreachable (${(error as Error).name}); skipping it for 2 minutes`);
+    }
+  }
+  throw new Error("no route to Royal Road"); // not reached: the last route returns or throws
 }
 
 /**

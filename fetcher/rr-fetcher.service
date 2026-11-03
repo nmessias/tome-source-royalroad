@@ -1,0 +1,16 @@
+# systemd user service for a desktop fetcher. Install:
+#   cp fetcher/rr-fetcher.service ~/.config/systemd/user/ && systemctl --user enable --now rr-fetcher
+# with the binary at ~/.local/bin/rr-fetcher and the token in ~/.config/rr-fetcher/token.
+[Unit]
+Description=Royal Road fetcher for Tome (tailnet only)
+After=network-online.target
+
+[Service]
+# Listen on the tailnet address only: Tome on Fly reaches it through Tailscale.
+ExecStart=/bin/sh -c 'RR_FETCHER_TOKEN=$(cat %h/.config/rr-fetcher/token) RR_FETCHER_ADDR=$(tailscale ip -4):8787 exec %h/.local/bin/rr-fetcher'
+# Tailscale may come up after login; retry until its address exists.
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target

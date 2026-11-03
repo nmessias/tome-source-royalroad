@@ -153,6 +153,42 @@ describe("Royal Road fetcher transport", () => {
     }
   });
 
+  test("routes fall through in order: down, challenged, then the next answers", async () => {
+    const page = (cf: string | null) => () => Response.json({ status: cf ? 403 : 200, url: "u", headers: cf ? [["cf-mitigated", cf]] : [], body: cf ?? "page" });
+    const down = fakeFetcher(() => Response.json({ error: "dial tcp: i/o timeout" }, { status: 502 }));
+    const challenged = fakeFetcher(page("challenge"));
+    const ok = fakeFetcher(page(null));
+    const url = (f: ReturnType<typeof fakeFetcher>) => `http://127.0.0.1:${f.server.port}`;
+    process.env.ROYAL_ROAD_FETCHER_URL = [down, challenged, ok].map(url).join(",");
+    try {
+      expect(await (await fetchRoyalRoad("https://www.royalroad.com/")).text()).toBe("page");
+      expect(await (await fetchRoyalRoad("https://www.royalroad.com/")).text()).toBe("page");
+      // The down route is skipped after its first failure; a challenge is retried each time.
+      expect([down.seen.length, challenged.seen.length, ok.seen.length]).toEqual([1, 2, 2]);
+
+      // The last route's challenge is the answer.
+      process.env.ROYAL_ROAD_FETCHER_URL = url(challenged);
+      const res = await fetchRoyalRoad("https://www.royalroad.com/");
+      expect(res.headers.get("cf-mitigated")).toBe("challenge");
+    } finally {
+      for (const f of [down, challenged, ok]) f.server.stop(true);
+    }
+  });
+
+  test("\"direct\" in the route list is impit itself", async () => {
+    const { seen, server } = fakeFetcher(() => Response.json({ error: "no route" }, { status: 504 }));
+    const direct = Bun.serve({ port: 0, fetch: () => new Response("direct") });
+    process.env.ROYAL_ROAD_FETCHER_URL += ",direct";
+    try {
+      const res = await fetchRoyalRoad(`http://127.0.0.1:${direct.port}/`);
+      expect(await res.text()).toBe("direct");
+      expect(seen).toHaveLength(1);
+    } finally {
+      server.stop(true);
+      direct.stop(true);
+    }
+  });
+
   test("without both variables, requests do not go to the fetcher", async () => {
     const { seen, server } = fakeFetcher(() => Response.json({}));
     delete process.env.ROYAL_ROAD_FETCHER_TOKEN;
